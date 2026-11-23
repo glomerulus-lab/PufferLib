@@ -222,7 +222,7 @@ __device__ __forceinline__ float sigmoid(float x) {
 // Per-layer 1-D param [rho, eta, 0...]. Padded to 8 so Muon's flat (unpadded)
 // param offsets stay aligned with the allocator's 16-byte-aligned layout.
 #define MPN_SCALARS 8
-#define MPN_INIT_RHO 2.0f  // lambda ~= 0.83
+#define MPN_INIT_RHO 3.0f  // lambda ~= 0.905
 #define MPN_INIT_ETA 1.0f
 
 __device__ __forceinline__ void mpn_coeffs(const precision_t* __restrict__ scal,
