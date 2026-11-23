@@ -1,8 +1,8 @@
 #pragma once
-// CPU NMMO3 policy: custom conv/embed encoder + MinGRU + decoder.
+// CPU NMMO3 policy: custom conv/embed encoder + MPN + decoder.
 // Weight order matches CUDA weights_create: encoder (conv1, conv2, embed,
-// proj_w), decoder, mingru layers. All encoder layers are bias-free.
-// Include puffercpu.c first (Conv2D / Linear / MinGRU).
+// proj_w), decoder, mpn layers. All encoder layers are bias-free.
+// Include puffercpu.c first (Conv2D / Linear / MPN).
 
 #define N3_MAP_H 11
 #define N3_MAP_W 15
@@ -38,7 +38,7 @@ struct MMONet {
     Linear* proj;
     ReLU* proj_relu;
     Linear* decoder;
-    MinGRU* mingru;
+    MPN* mpn;
     Multidiscrete* multidiscrete;
 };
 
@@ -49,8 +49,7 @@ static inline int nmmo3_weight_count(int hidden, int layers) {
     n += N3_EMBED_VOCAB * N3_EMBED_DIM;
     n += hidden * N3_CONCAT;
     n += (N3_ATN + 1) * hidden;
-    n += layers * 3 * hidden * hidden;
-    return n;
+    return mpn_weight_count(n, hidden, layers);
 }
 
 static inline MMONet* init_mmonet_arch(Weights* weights, int num_agents,
@@ -74,7 +73,7 @@ static inline MMONet* init_mmonet_arch(Weights* weights, int num_agents,
     net->proj = make_linear(weights, num_agents, N3_CONCAT, hidden);
     net->proj_relu = make_relu(num_agents, hidden);
     net->decoder = make_linear(weights, num_agents, hidden, N3_ATN + 1);
-    net->mingru = make_mingru(weights, num_agents, hidden, layers);
+    net->mpn = make_mpn(weights, num_agents, hidden, layers);
     int logit_sizes[1] = {N3_ATN};
     net->multidiscrete = make_multidiscrete(num_agents, logit_sizes, 1);
     return net;
@@ -97,7 +96,7 @@ static inline void free_mmonet(MMONet* net) {
     free(net->proj);
     free(net->proj_relu);
     free(net->decoder);
-    free_mingru(net->mingru);
+    free_mpn(net->mpn);
     free(net->multidiscrete);
     free(net);
 }
@@ -171,9 +170,9 @@ static inline void mmonet_encode(MMONet* net, unsigned char* observations,
 
 static inline void forward(MMONet* net, unsigned char* observations,
         float* terminals, float* actions) {
-    mingru_zero_term(net->mingru, terminals);
+    mpn_zero_term(net->mpn, terminals);
     mmonet_encode(net, observations, NULL);
-    mingru(net->mingru, net->proj_relu->output);
-    linear(net->decoder, net->mingru->output);
+    mpn(net->mpn, net->proj_relu->output);
+    linear(net->decoder, net->mpn->output);
     multidiscrete(net->multidiscrete, net->decoder->output, actions, 0, NULL);
 }

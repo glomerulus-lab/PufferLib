@@ -1,11 +1,11 @@
-// Minimal Kimi Delta Attention (KDA) recurrent toy vs MinGRU seq scan.
+// Minimal Kimi Delta Attention (KDA) recurrent toy vs MPN seq scan.
 //
 // Paper: arXiv:2510.26692  (KDA recurrence only — no ShortConv / MLA hybrid / MoE)
 //
 //   S_t = Diag(α_t) (I − β_t k_t k_t^T) S_{t−1} + β_t k_t v_t^T
 //   o_t = S_t^T q_t
 //
-// Single head, d_k = d_v = D. State is D×D per sequence (vs MinGRU's D vector).
+// Single head, d_k = d_v = D. State is D×D per sequence (vs MPN's D vector).
 //
 // Build:
 //   nvcc -O3 --use_fast_math -arch=native -std=c++17 tests/kda_toy.cu -o kda_toy
@@ -40,10 +40,10 @@ __device__ __forceinline__ float d_lerp(float a, float b, float w) {
     return (fabsf(w) < 0.5f) ? a + w * diff : b - diff * (1.0f - w);
 }
 
-// ---- MinGRU seq scan (linear-h, highway, no terminals) ----
+// ---- MPN seq scan (linear-h, highway, no terminals) ----
 // One thread per (b, h). combined layout (B, T, 3H): [h_tilde, gate, proj] along last dim.
 
-__global__ void mingru_scan_fwd(
+__global__ void mpn_scan_fwd(
         float* __restrict__ out,
         float* __restrict__ next_state,
         const float* __restrict__ combined,
@@ -161,7 +161,7 @@ __global__ void kda_scan_fwd(
 
 struct Bench {
     int B, T, H;
-    // MinGRU
+    // MPN
     float *mg_combined, *mg_state, *mg_x, *mg_out, *mg_ns;
     // KDA
     float *kda_q, *kda_k, *kda_v, *kda_alpha, *kda_beta, *kda_out, *kda_S;
@@ -207,7 +207,7 @@ static Bench make_bench(int B, int T, int H) {
 
     fill_randn(b.mg_combined, BTH * 3, 2.0f);
     fill_randn(b.mg_state, (size_t)B * H, 0.5f);
-    // state non-negative-ish like mingru
+    // state non-negative-ish like mpn
     {
         float* h = (float*)malloc((size_t)B * H * sizeof(float));
         ck(cudaMemcpy(h, b.mg_state, (size_t)B * H * sizeof(float), cudaMemcpyDeviceToHost), "D2H");
@@ -242,11 +242,11 @@ static void free_bench(Bench& b) {
     cudaFree(b.kda_S);
 }
 
-static void launch_mingru(Bench& b) {
+static void launch_mpn(Bench& b) {
     int n = b.B * b.H;
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
-    mingru_scan_fwd<<<blocks, threads>>>(
+    mpn_scan_fwd<<<blocks, threads>>>(
         b.mg_out, b.mg_ns, b.mg_combined, b.mg_state, b.mg_x, b.B, b.T, b.H);
 }
 
@@ -375,12 +375,12 @@ static void print_bytes(const char* name, double bytes, float ms) {
 static void run_case(int B, int T, int H, int warmup, int iters) {
     Bench b = make_bench(B, T, H);
     // touch once for alloc
-    launch_mingru(b);
+    launch_mpn(b);
     launch_kda(b);
     ck(cudaDeviceSynchronize(), "touch");
     ck(cudaGetLastError(), "launch");
 
-    float mg_ms = time_ms(launch_mingru, b, warmup, iters);
+    float mg_ms = time_ms(launch_mpn, b, warmup, iters);
     float kda_ms = time_ms(launch_kda, b, warmup, iters);
 
     size_t BT = (size_t)B * T;
@@ -395,13 +395,13 @@ static void run_case(int B, int T, int H, int warmup, int iters) {
         (double)B * H * H * 4;                 // S_final write (and smem not in DRAM)
 
     printf("T=%4d  B=%5d  H=%3d  tokens=%7zu\n", T, B, H, BT * (size_t)H);
-    printf("  MinGRU seq          %7.1f us   (%.2fx vs KDA)\n",
+    printf("  MPN seq          %7.1f us   (%.2fx vs KDA)\n",
         mg_ms * 1000.0, kda_ms / std::max(mg_ms, 1e-9f));
-    printf("  KDA recurrent       %7.1f us   (%.2fx vs MinGRU)\n",
+    printf("  KDA recurrent       %7.1f us   (%.2fx vs MPN)\n",
         kda_ms * 1000.0, mg_ms / std::max(kda_ms, 1e-9f));
-    print_bytes("MinGRU I/O est", mg_bytes, mg_ms);
+    print_bytes("MPN I/O est", mg_bytes, mg_ms);
     print_bytes("KDA I/O est", kda_bytes, kda_ms);
-    printf("  state sizes: MinGRU %zu B  |  KDA S %zu B  (×%.1f)\n",
+    printf("  state sizes: MPN %zu B  |  KDA S %zu B  (×%.1f)\n",
         (size_t)B * H * 4,
         (size_t)B * H * H * 4,
         (double)H);
@@ -434,7 +434,7 @@ int main(int argc, char** argv) {
         H = atoi(argv[1]);
     }
 
-    printf("KDA toy vs MinGRU seq  (f32, single-head KDA, D=H)\n");
+    printf("KDA toy vs MPN seq  (f32, single-head KDA, D=H)\n");
     printf("device: ");
     {
         cudaDeviceProp prop;
@@ -477,10 +477,10 @@ int main(int argc, char** argv) {
     }
 
     printf("Notes:\n");
-    printf("  - KDA state is D×D per sequence; MinGRU is D. Ratio = D.\n");
+    printf("  - KDA state is D×D per sequence; MPN is D. Ratio = D.\n");
     printf("  - This KDA kernel is a faithful recurrent toy (not FLA chunk kernel).\n");
     printf("  - No ShortConv / output gate / MLA hybrid from the full paper.\n");
     printf("  - Times are kernel-only; a real policy still pays QKV-like projs for KDA\n");
-    printf("    (MinGRU already includes its 3H combined as input traffic here).\n");
+    printf("    (MPN already includes its 3H combined as input traffic here).\n");
     return 0;
 }

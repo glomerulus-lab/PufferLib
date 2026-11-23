@@ -448,73 +448,90 @@ void multidiscrete(Multidiscrete* layer, float* input, float* output, int hard,
         layer->num_actions, hard, mask);
 }
 
-// MinGRU: inference-only single-step recurrent layer.
-// Matches the fused gate + highway connection in models.cu mingru_gate kernel.
-// Each layer has a bias-free projection (hidden -> 3*hidden).
+// MPN (MPNpre + highway): inference-only single step, mirrors algo.cu mpn_forward.
+//   u = x*(1+m); [a|g] = u @ W^T; out = s*tanh(a) + (1-s)*x, s = sigmoid(g)
+//   m <- lambda*m + c*x,  lambda = MPN_LAMBDA_MAX*sigmoid(rho), c = eta/sqrt(H)
+// Per layer in the weight file: W (2*hidden x hidden), then [rho, eta, pad] (MPN_SCALARS).
 // State layout: (num_layers, batch_size, hidden_size).
-typedef struct MinGRU {
+#define MPN_LAMBDA_MAX 0.95f
+#define MPN_SCALARS 8
+typedef struct MPN {
     float* state;    // (num_layers, batch_size, hidden_size) - persists across steps
     float* output;   // (batch_size, hidden_size)
-    Linear** proj;   // [num_layers], each projects hidden -> 3*hidden
+    float* u;        // (batch_size, hidden_size) modulated input
+    Linear** proj;   // [num_layers], each projects hidden -> 2*hidden
+    float** scalars; // [num_layers], each [rho, eta, pad...]
     int batch_size;
     int hidden_size;
     int num_layers;
-} MinGRU;
+} MPN;
 
-MinGRU* make_mingru(Weights* weights, int batch_size, int hidden_size, int num_layers) {
-    MinGRU* layer = calloc(1, sizeof(MinGRU));
+MPN* make_mpn(Weights* weights, int batch_size, int hidden_size, int num_layers) {
+    MPN* layer = calloc(1, sizeof(MPN));
     layer->state = calloc(num_layers * batch_size * hidden_size, sizeof(float));
     layer->output = calloc(batch_size * hidden_size, sizeof(float));
+    layer->u = calloc(batch_size * hidden_size, sizeof(float));
     layer->proj = calloc(num_layers, sizeof(Linear*));
+    layer->scalars = calloc(num_layers, sizeof(float*));
     layer->batch_size  = batch_size;
     layer->hidden_size = hidden_size;
     layer->num_layers  = num_layers;
     for (int l = 0; l < num_layers; l++) {
-        layer->proj[l] = make_linear(weights, batch_size, hidden_size, 3 * hidden_size);
+        layer->proj[l] = make_linear(weights, batch_size, hidden_size, 2 * hidden_size);
+        layer->scalars[l] = get_weights_aligned(weights, MPN_SCALARS);
     }
     return layer;
 }
 
-void mingru(MinGRU* layer, float* input) {
+void mpn(MPN* layer, float* input) {
     int B = layer->batch_size;
     int H = layer->hidden_size;
     float* x = input;
     for (int l = 0; l < layer->num_layers; l++) {
         float* state_l = layer->state + l * B * H;
-        linear(layer->proj[l], x);
+        float lam = MPN_LAMBDA_MAX * _sigmoid(layer->scalars[l][0]);
+        float c = layer->scalars[l][1] / sqrtf((float)H);
+        for (int i = 0; i < B * H; i++) {
+            float m = state_l[i];
+            layer->u[i] = x[i] * (1.0f + m);
+            state_l[i] = lam * m + c * x[i];
+        }
+        linear(layer->proj[l], layer->u);
         float* combined = layer->proj[l]->output;
         for (int b = 0; b < B; b++) {
-            float* cb = combined + b * 3 * H;
-            float* sb = state_l + b * H;
+            float* cb = combined + b * 2 * H;
             float* xb = x + b * H;
             float* ob = layer->output + b * H;
             for (int h = 0; h < H; h++) {
-                float hidden     = cb[h];
-                float gate       = cb[H + h];
-                float hw         = cb[2*H + h];
-                float s          = sb[h];
-                float gate_s     = _sigmoid(gate);
-                float h_tilde    = (hidden >= 0.0f) ? hidden + 0.5f : _sigmoid(hidden);
-                float mingru_out = s + gate_s * (h_tilde - s);
-                float hw_s       = _sigmoid(hw);
-                ob[h] = hw_s * mingru_out + (1.0f - hw_s) * xb[h];
-                sb[h] = mingru_out;
+                float s = _sigmoid(cb[H + h]);
+                ob[h] = s * tanhf(cb[h]) + (1.0f - s) * xb[h];
             }
         }
         x = layer->output;
     }
 }
 
-void free_mingru(MinGRU* layer) {
+// Weight-file floats for num_layers MPN layers starting at 8-aligned offset n.
+static inline int mpn_weight_count(int n, int hidden, int num_layers) {
+    for (int l = 0; l < num_layers; l++) {
+        n = (n + 2 * hidden * hidden + 7) & ~7;
+        n = (n + MPN_SCALARS + 7) & ~7;
+    }
+    return n;
+}
+
+void free_mpn(MPN* layer) {
     for (int l = 0; l < layer->num_layers; l++) free(layer->proj[l]);
     free(layer->state);
     free(layer->output);
+    free(layer->u);
     free(layer->proj);
+    free(layer->scalars);
     free(layer);
 }
 
 // Trainer zero_term_state: clear carry before encoding a post-terminal obs.
-void mingru_zero_term(MinGRU* layer, const float* terminals) {
+void mpn_zero_term(MPN* layer, const float* terminals) {
     int B = layer->batch_size;
     int H = layer->hidden_size;
     for (int b = 0; b < B; b++) {
@@ -528,17 +545,17 @@ void mingru_zero_term(MinGRU* layer, const float* terminals) {
 }
 
 // PufferNet: default policy matching the native backend Arch in algo.cu.
-// Architecture: Linear encoder -> N x MinGRU -> Linear decoder (fused value).
+// Architecture: Linear encoder -> N x MPN -> Linear decoder (fused value).
 // Weight file order (matches weights_create reg_params call order):
 //   encoder weight (hidden_dim x input_dim)
 //   decoder weight ((atn_sum+1) x hidden_dim, last output is value)
 //   decoder logstd (1 x num_actions) IF continuous
-//   mingru weights[0..num_layers-1] (3*hidden_dim x hidden_dim each)
+//   per mpn layer: W (2*hidden_dim x hidden_dim), then [rho, eta, pad] (MPN_SCALARS)
 typedef struct PufferNet {
     int num_agents;
     float* obs;
     Linear* encoder;
-    MinGRU* mingru;
+    MPN* mpn;
     Linear* decoder;   // output_dim = atn_sum+1; last element is value
     float* log_std;
     int is_continuous;
@@ -565,7 +582,7 @@ PufferNet* make_puffernet(Weights* weights, int num_agents, int input_dim,
     if (net->is_continuous) {
         net->log_std = get_weights_aligned(weights, num_actions);
     }
-    net->mingru  = make_mingru(weights, num_agents, hidden_dim, num_layers);
+    net->mpn  = make_mpn(weights, num_agents, hidden_dim, num_layers);
     if (!net->is_continuous) {
         net->multidiscrete = make_multidiscrete(num_agents, logit_sizes, num_actions);
     }
@@ -583,10 +600,10 @@ void _gaussian_mean(float* input, float* output, int batch_size, int num_actions
 
 void forward_puffernet(PufferNet* net, float* observations, float* actions,
         const unsigned char* mask, const float* terminals) {
-    mingru_zero_term(net->mingru, terminals);
+    mpn_zero_term(net->mpn, terminals);
     linear(net->encoder, observations);
-    mingru(net->mingru, net->encoder->output);
-    linear(net->decoder, net->mingru->output);
+    mpn(net->mpn, net->encoder->output);
+    linear(net->decoder, net->mpn->output);
     if (net->is_continuous) {
         _gaussian_mean(net->decoder->output, actions, net->num_agents, net->num_actions);
     } else {
@@ -598,7 +615,7 @@ void free_puffernet(PufferNet* net) {
     free(net->obs);
     free(net->encoder);
     free(net->decoder);
-    free_mingru(net->mingru);
+    free_mpn(net->mpn);
     free(net->multidiscrete);
     free(net);
 }
@@ -632,10 +649,7 @@ static int puffernet_weight_count(int input_dim, int hidden, int layers,
     if (continuous) {
         n = puf_align8(n + num_actions);
     }
-    for (int l = 0; l < layers; l++) {
-        n = puf_align8(n + 3 * hidden * hidden);
-    }
-    return n;
+    return mpn_weight_count(n, hidden, layers);
 }
 #endif
 

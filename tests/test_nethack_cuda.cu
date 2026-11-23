@@ -248,7 +248,7 @@ void nh_get_eeff(void* dst) { cudaMemcpy(dst, g_a->e_eff.data, (size_t)NH_GLYPH_
 void nh_get_concat(void* dst, int B) { cudaMemcpy(dst, g_a->concat.data, (size_t)B * NH_CONCAT * sizeof(float), cudaMemcpyDeviceToDevice); cudaDeviceSynchronize(); }
 
 // ---- pointer decoder (fed by the encoder's inv_out keys) ----
-// forward: encoder -> decoder directly (no mingru in the harness); the
+// forward: encoder -> decoder directly (no mpn in the harness); the
 // decoder kernels see the same activations either way.
 
 void nh_dec_forward(void* out, void* obs, int B) {
@@ -270,7 +270,7 @@ void nh_dec_backward(void* glogits, void* gvalue, void* dinput, int B) {
     cudaDeviceSynchronize();
 }
 
-// decoder fed with an EXTERNAL hidden state (e.g. the demo's mingru output);
+// decoder fed with an EXTERNAL hidden state (e.g. the demo's mpn output);
 // runs the encoder first so the decoder's inv keys (ea->inv_out) are fresh
 // for the same obs.
 void nh_dec_forward_hidden(void* out, void* obs, void* hidden_in, int B) {

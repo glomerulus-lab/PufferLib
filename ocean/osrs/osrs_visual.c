@@ -925,7 +925,8 @@ static int64_t visual_policy_expected_weight_count(
     }
     for (int i = 0; i < num_layers; i++) {
         total = visual_policy_advance_weight_offset(
-            total, (int64_t)3 * hidden_size * hidden_size);
+            total, (int64_t)2 * hidden_size * hidden_size);
+        total = visual_policy_advance_weight_offset(total, MPN_SCALARS);
     }
     return total;
 }
@@ -1086,8 +1087,10 @@ static VisualNet* visual_policy_make_puffernet(
     int64_t off_after_logstd = off;
     for (int l = 0; l < num_layers; l++) {
         char name[32];
-        snprintf(name, sizeof(name), "mingru.proj[%d]", l);
-        off = visual_policy_layout_tensor(name, off, (int64_t)3 * hidden_dim * hidden_dim);
+        snprintf(name, sizeof(name), "mpn.proj[%d]", l);
+        off = visual_policy_layout_tensor(name, off, (int64_t)2 * hidden_dim * hidden_dim);
+        snprintf(name, sizeof(name), "mpn.scalars[%d]", l);
+        off = visual_policy_layout_tensor(name, off, MPN_SCALARS);
     }
     int64_t off_total = off;
 
@@ -1107,8 +1110,8 @@ static VisualNet* visual_policy_make_puffernet(
         visual_policy_assert_offset("logstd", weights, off_after_logstd);
     }
 
-    net->mingru = make_mingru(weights, 1, hidden_dim, num_layers);
-    visual_policy_assert_offset("mingru", weights, off_total);
+    net->mpn = make_mpn(weights, 1, hidden_dim, num_layers);
+    visual_policy_assert_offset("mpn", weights, off_total);
 
     if (!net->is_continuous) {
         net->multidiscrete = make_multidiscrete(1, action_dims, num_action_heads);
@@ -1226,11 +1229,11 @@ static void __attribute__((unused)) visual_policy_destroy(VisualPolicy* policy) 
 }
 
 static void visual_policy_reset_recurrent(VisualPolicy* policy) {
-    if (!policy || !policy->net || !policy->net->mingru) return;
-    memset(policy->net->mingru->state, 0,
-        (size_t)policy->net->mingru->num_layers *
-        (size_t)policy->net->mingru->batch_size *
-        (size_t)policy->net->mingru->hidden_size *
+    if (!policy || !policy->net || !policy->net->mpn) return;
+    memset(policy->net->mpn->state, 0,
+        (size_t)policy->net->mpn->num_layers *
+        (size_t)policy->net->mpn->batch_size *
+        (size_t)policy->net->mpn->hidden_size *
         sizeof(float));
 }
 
@@ -1285,8 +1288,8 @@ static void visual_policy_actions_from_obs(VisualPolicy* policy, int* actions) {
         linear(policy->net->encoder, policy->obs);
         encoded = policy->net->encoder->output;
     }
-    mingru(policy->net->mingru, encoded);
-    linear(policy->net->decoder, policy->net->mingru->output);
+    mpn(policy->net->mpn, encoded);
+    linear(policy->net->decoder, policy->net->mpn->output);
 
     const float* logits = policy->net->decoder->output;
     const float* mask = policy->obs + policy->obs_size;

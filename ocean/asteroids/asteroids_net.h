@@ -1,11 +1,11 @@
-// CPU asteroids policy: entity encoder + MinGRU + decoder.
+// CPU asteroids policy: entity encoder + MPN + decoder.
 // Weight order matches CUDA weights_create / reg_params:
 //   encoder input_w (16 x 9), encoder output_w (hidden x 16),
-//   decoder ((4+1) x hidden), mingru layers (3*hidden x hidden each).
+//   decoder ((4+1) x hidden), mpn layers (W 2*hidden x hidden, then MPN_SCALARS each).
 // Forward matches ocean/asteroids/asteroids.cu:
 //   materialize 26 entities [self(4) | point_i(5)], Linear 9->16, ReLU,
-//   Linear 16->hidden, max-pool over the 26 points, then MinGRU + decoder.
-// Include puffercpu.c first (Linear / ReLU / MinGRU).
+//   Linear 16->hidden, max-pool over the 26 points, then MPN + decoder.
+// Include puffercpu.c first (Linear / ReLU / MPN).
 
 #define AE_SELF_DIM 4
 #define AE_POINT_DIM 5
@@ -29,7 +29,7 @@ struct AsteroidsNet {
     ReLU* entity_relu;
     Linear* out_fc;
     Linear* decoder;
-    MinGRU* mingru;
+    MPN* mpn;
     Multidiscrete* multidiscrete;
 };
 
@@ -42,10 +42,7 @@ static inline int asteroids_weight_count(int hidden, int layers) {
     n = puf_ae_align8(n + AE_ENTITY_HIDDEN * AE_ENTITY_IN);
     n = puf_ae_align8(n + hidden * AE_ENTITY_HIDDEN);
     n = puf_ae_align8(n + (AE_ATN + 1) * hidden);
-    for (int l = 0; l < layers; l++) {
-        n = puf_ae_align8(n + 3 * hidden * hidden);
-    }
-    return n;
+    return mpn_weight_count(n, hidden, layers);
 }
 
 static inline AsteroidsNet* init_asteroids_net(Weights* weights, int num_agents,
@@ -62,7 +59,7 @@ static inline AsteroidsNet* init_asteroids_net(Weights* weights, int num_agents,
     net->out_fc = make_linear(weights, num_agents * AE_NUM_POINTS,
         AE_ENTITY_HIDDEN, hidden);
     net->decoder = make_linear(weights, num_agents, hidden, AE_ATN + 1);
-    net->mingru = make_mingru(weights, num_agents, hidden, layers);
+    net->mpn = make_mpn(weights, num_agents, hidden, layers);
     int logit_sizes[1] = {AE_ATN};
     net->multidiscrete = make_multidiscrete(num_agents, logit_sizes, 1);
     return net;
@@ -75,7 +72,7 @@ static inline void free_asteroids_net(AsteroidsNet* net) {
     free(net->entity_relu);
     free(net->out_fc);
     free(net->decoder);
-    free_mingru(net->mingru);
+    free_mpn(net->mpn);
     free(net->multidiscrete);
     free(net);
 }
@@ -106,9 +103,9 @@ static inline void asteroids_encode(AsteroidsNet* net, const float* observations
 
 static inline void forward_asteroids(AsteroidsNet* net, const float* observations,
         float* terminals, float* actions) {
-    mingru_zero_term(net->mingru, terminals);
+    mpn_zero_term(net->mpn, terminals);
     asteroids_encode(net, observations, NULL);
-    mingru(net->mingru, net->encoded);
-    linear(net->decoder, net->mingru->output);
+    mpn(net->mpn, net->encoded);
+    linear(net->decoder, net->mpn->output);
     multidiscrete(net->multidiscrete, net->decoder->output, actions, 0, NULL);
 }

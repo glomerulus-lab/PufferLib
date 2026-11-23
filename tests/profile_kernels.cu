@@ -31,8 +31,8 @@ void print_usage(const char* prog) {
     printf("Usage: %s <profile>\n", prog);
     printf("\nProfiles:\n");
     printf("  kernels        - All individual kernel microbenchmarks\n");
-    printf("  mingrugate     - MinGRU gate kernel only\n");
-    printf("  fusedscan      - MinGRU seq scan fwd+bwd\n");
+    printf("  mpngate     - MPN gate kernel only\n");
+    printf("  fusedscan      - MPN seq scan fwd+bwd\n");
     printf("    --batch N --horizon N --hidden N\n");
     printf("  fusedscan-sweep - Seq scan vs T at fixed B*T=65536\n");
     printf("  samplelogits   - Sample logits kernel only\n");
@@ -103,14 +103,14 @@ inline float profile_kernel(kernel_fn fn, void* args) {
     return ms / TIMING_ITERS;
 }
 
-struct MingruGateProfile {
+struct MpnGateProfile {
     Prec state, combined, x_in, out, next_state;
     Allocator alloc;
     int B, H;
 };
 
-MingruGateProfile* create_mingrugate(int B, int H) {
-    auto* p = (MingruGateProfile*)calloc(1, sizeof(MingruGateProfile));
+MpnGateProfile* create_mpngate(int B, int H) {
+    auto* p = (MpnGateProfile*)calloc(1, sizeof(MpnGateProfile));
     p->B = B; p->H = H;
     p->state     = {.shape = {B, H}};
     p->combined  = {.shape = {B, 3*H}};
@@ -137,16 +137,16 @@ MingruGateProfile* create_mingrugate(int B, int H) {
     return p;
 }
 
-void run_mingrugate(MingruGateProfile* p) {
-    mingru_gate<<<grid_size(p->B * p->H), BLOCK_SIZE>>>(
+void run_mpngate(MpnGateProfile* p) {
+    mpn_gate<<<grid_size(p->B * p->H), BLOCK_SIZE>>>(
         p->out.data, p->next_state.data, p->combined.data,
         p->state.data, p->x_in.data, p->H, p->B);
 }
 
-void profile_mingrugate(int B, int H) {
-    printf("mingru_gate (B=%d, H=%d)\n", B, H);
-    auto* p = create_mingrugate(B, H);
-    float ms = profile_kernel((kernel_fn)run_mingrugate, p);
+void profile_mpngate(int B, int H) {
+    printf("mpn_gate (B=%d, H=%d)\n", B, H);
+    auto* p = create_mpngate(B, H);
+    float ms = profile_kernel((kernel_fn)run_mpngate, p);
     print_timing("forward", ms, B);
     printf("\n");
     cudaFree(p->alloc.mem);
@@ -219,10 +219,10 @@ FusedScanProfile* create_fusedscan(int B, int T, int H) {
 }
 
 void run_fusedscan_fwd(FusedScanProfile* p) {
-    mingru_scan_forward_seq<<<grid_size(p->B * p->H), BLOCK_SIZE>>>(p->scan);
+    mpn_scan_forward_seq<<<grid_size(p->B * p->H), BLOCK_SIZE>>>(p->scan);
 }
 void run_fusedscan_bwd(FusedScanProfile* p) {
-    mingru_scan_backward<<<grid_size(p->B * p->H), BLOCK_SIZE>>>(
+    mpn_scan_backward<<<grid_size(p->B * p->H), BLOCK_SIZE>>>(
         p->scan, p->grad_out.data, p->grad_next_state.data);
 }
 
@@ -1358,8 +1358,8 @@ int main(int argc, char** argv) {
     warmup_gpu();
     bool run_all = strcmp(profile, "all") == 0;
 
-    if (strcmp(profile, "kernels") == 0 || strcmp(profile, "mingrugate") == 0 || run_all)
-        profile_mingrugate(BR, H_);
+    if (strcmp(profile, "kernels") == 0 || strcmp(profile, "mpngate") == 0 || run_all)
+        profile_mpngate(BR, H_);
     if (strcmp(profile, "kernels") == 0 || strcmp(profile, "fusedscan") == 0 || run_all)
         profile_fusedscan(scan_batch, scan_T, scan_H);
     if (strcmp(profile, "fusedscan-sweep") == 0)
@@ -1380,7 +1380,7 @@ int main(int argc, char** argv) {
 
     if (!run_all
         && strcmp(profile, "kernels") != 0
-        && strcmp(profile, "mingrugate") != 0
+        && strcmp(profile, "mpngate") != 0
         && strcmp(profile, "fusedscan") != 0
         && strcmp(profile, "fusedscan-sweep") != 0
         && strcmp(profile, "samplelogits") != 0

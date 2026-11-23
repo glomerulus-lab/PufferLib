@@ -1,8 +1,8 @@
-// CPU Craftax encoder: bag-of-embeddings + projection, then MinGRU + decoder.
-// Weight order matches CUDA create_craftax_encoder + algo decoder/mingru:
+// CPU Craftax encoder: bag-of-embeddings + projection, then MPN + decoder.
+// Weight order matches CUDA create_craftax_encoder + algo decoder/mpn:
 //   embed (154 x 16), proj (hidden x 1635), decoder ((ATN_DIM+1) x hidden),
-//   mingru layers (3*hidden x hidden each).
-// Include puffercpu.c first (Linear / MinGRU / multidiscrete).
+//   mpn layers (W 2*hidden x hidden, then MPN_SCALARS each).
+// Include puffercpu.c first (Linear / MPN / multidiscrete).
 
 #define CX_NUM_CELLS (OBS_ROWS * OBS_COLS)
 #define CX_CHANNELS 8
@@ -25,7 +25,7 @@ typedef struct CraftaxNet {
     float* concat;
     Linear* proj;
     Linear* decoder;
-    MinGRU* mingru;
+    MPN* mpn;
     Multidiscrete* multidiscrete;
 } CraftaxNet;
 
@@ -38,10 +38,7 @@ static inline int craftax_weight_count(int hidden, int layers) {
     n = puf_cx_align8(n + CX_VOCAB_TOTAL * CX_EMB_DIM);
     n = puf_cx_align8(n + hidden * CX_CONCAT);
     n = puf_cx_align8(n + (ATN_DIM + 1) * hidden);
-    for (int l = 0; l < layers; l++) {
-        n = puf_cx_align8(n + 3 * hidden * hidden);
-    }
-    return n;
+    return mpn_weight_count(n, hidden, layers);
 }
 
 static inline CraftaxNet* init_craftax_net(Weights* weights, int num_agents,
@@ -54,7 +51,7 @@ static inline CraftaxNet* init_craftax_net(Weights* weights, int num_agents,
     net->concat = (float*)calloc((size_t)num_agents * CX_CONCAT, sizeof(float));
     net->proj = make_linear(weights, num_agents, CX_CONCAT, hidden);
     net->decoder = make_linear(weights, num_agents, hidden, ATN_DIM + 1);
-    net->mingru = make_mingru(weights, num_agents, hidden, layers);
+    net->mpn = make_mpn(weights, num_agents, hidden, layers);
     int logit_sizes[1] = {ATN_DIM};
     net->multidiscrete = make_multidiscrete(num_agents, logit_sizes, 1);
     return net;
@@ -90,10 +87,10 @@ static inline void craftax_encode(CraftaxNet* net, const float* observations) {
 
 static inline void forward_craftax(CraftaxNet* net, const float* observations,
         float* terminals, float* actions, const unsigned char* mask) {
-    mingru_zero_term(net->mingru, terminals);
+    mpn_zero_term(net->mpn, terminals);
     craftax_encode(net, observations);
-    mingru(net->mingru, net->proj->output);
-    linear(net->decoder, net->mingru->output);
+    mpn(net->mpn, net->proj->output);
+    linear(net->decoder, net->mpn->output);
     multidiscrete(net->multidiscrete, net->decoder->output, actions,
         net->greedy, mask);
 }
