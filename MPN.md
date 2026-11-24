@@ -16,7 +16,7 @@ Implementation: `src/algo.cu` (`mpn_*` kernels and `mpn_forward`,
 | $H$ | — | hidden width (input and output width of every layer) |
 | $x_t$ | $\mathbb{R}^H$ | layer input at step $t$ |
 | $m_t$ | $\mathbb{R}^H$ | plastic state (the recurrent carry) after step $t$ |
-| $W = \begin{bmatrix} W_a \\ W_g \end{bmatrix}$ | $\mathbb{R}^{2H \times H}$ | slow weights (no bias) |
+| $W =  [W_a;  W_g]$ | $\mathbb{R}^{2H \times H}$ | slow weights (no bias) |
 | $\rho, \eta$ | scalars | learned plasticity parameters, one pair per layer |
 | $d_t$ | $\{0,1\}$ | terminal flag delivered together with $x_t$ |
 | $\sigma$ | — | logistic sigmoid |
@@ -27,7 +27,7 @@ Implementation: `src/algo.cu` (`mpn_*` kernels and `mpn_forward`,
 Per layer, the two scalar parameters are mapped to a decay and a learning rate:
 
 $$
-\lambda = \lambda_{\max}\,\sigma(\rho), \qquad \lambda_{\max} = 0.95,
+\lambda = \lambda_{\max} \sigma(\rho), \qquad \lambda_{\max} = 0.95,
 \qquad c = \frac{\eta}{\sqrt{H}} .
 $$
 
@@ -38,12 +38,12 @@ Given the carried state $m_{t-1}$, each step is:
 
 $$
 \begin{aligned}
-\tilde m_{t-1} &= (1 - d_t)\, m_{t-1} && \text{(reset at episode boundary)} \\
+\tilde m_{t-1} &= (1 - d_t)  m_{t-1} && \text{(reset at episode boundary)} \\
 u_t &= x_t \odot (1 + \tilde m_{t-1}) && \text{(presynaptic modulation)} \\
 a_t &= W_a u_t, \quad g_t = W_g u_t && \text{(one } 2H \times H \text{ GEMM)} \\
 s_t &= \sigma(g_t) \\
 y_t &= s_t \odot \tanh(a_t) + (1 - s_t) \odot x_t && \text{(gated highway output)} \\
-m_t &= \lambda\, \tilde m_{t-1} + c\, x_t && \text{(plasticity update)}
+m_t &= \lambda  \tilde m_{t-1} + c  x_t && \text{(plasticity update)}
 \end{aligned}
 $$
 
@@ -56,17 +56,17 @@ carried state tensor is $(L, A, H)$ for $A$ agents, the same shape MinGRU used.
 The general MPN modulates a weight matrix with a fast, plastic matrix $M_t$:
 
 $$
-h_t = \phi\big((W \odot (1 + M_{t-1}))\, x_t\big), \qquad
-M_t = \lambda M_{t-1} + \eta\, (\text{post}) \, x_t^{\top}.
+h_t = \phi\big((W \odot (1 + M_{t-1}))  x_t\big), \qquad
+M_t = \lambda M_{t-1} + \eta  (\text{post})   x_t^{\top}.
 $$
 
 In the **pre**-synaptic variant the Hebbian update depends only on the
-presynaptic activity, $M_t = \lambda M_{t-1} + c\,\mathbf{1} x_t^\top$, so (from
+presynaptic activity, $M_t = \lambda M_{t-1} + c \mathbf{1} x_t^\top$, so (from
 a zero or row-constant start) every row of $M$ is the same vector $m_t^\top$.
 The modulated product then factors:
 
 $$
-(W \odot (1 + \mathbf{1} m^\top))\, x = W\,\big(x \odot (1 + m)\big) = W u .
+(W \odot (1 + \mathbf{1} m^\top))  x = W \big(x \odot (1 + m)\big) = W u .
 $$
 
 This is why the layer only stores an $H$-vector of state rather than an
@@ -80,7 +80,7 @@ it scales the inputs to the candidate $a_t$ and to the gate $g_t$ alike.
   $m_t = \lambda^{t} m_0 + c \sum_{k=0}^{t-1} \lambda^{k} x_{t-k}$.
   Its effective time constant is $1/(1-\lambda)$ steps, and its steady-state
   gain is $c/(1-\lambda)$. For bounded input,
-  $\|m\|_\infty \le \max(\|m_0\|_\infty,\ c\,\|x\|_\infty / (1-\lambda))$.
+  $\|m\|_\infty \le \max(\|m_0\|_\infty,\ c \|x\|_\infty / (1-\lambda))$.
 - **There is no hidden-to-state feedback.** $m$ depends only on the inputs
   $x$, never on $y$ or $W$. The recurrence is a diagonal linear system per
   layer, so training over a horizon is a cheap elementwise scan, and all the
@@ -94,7 +94,7 @@ it scales the inputs to the candidate $a_t$ and to the gate $g_t$ alike.
 | Parameter | Init | Resulting value |
 |---|---|---|
 | $W$ | Kaiming (gain 1) on the $(2H, H)$ matrix | — |
-| $\rho$ | $3.0$ | $\lambda = 0.95\,\sigma(3) \approx 0.905$ (time constant ≈ 10.5 steps) |
+| $\rho$ | $3.0$ | $\lambda = 0.95 \sigma(3) \approx 0.905$ (time constant ≈ 10.5 steps) |
 | $\eta$ | $1.0$ | $c = 1/\sqrt{H}$ |
 
 ## Training: truncated BPTT over the horizon
@@ -116,7 +116,7 @@ $$
 
 $$
 \frac{\partial \mathcal L}{\partial u_t} = W^\top e_t, \qquad
-\frac{\partial \mathcal L}{\partial W} = \sum_{b,t} e_t\, u_t^\top .
+\frac{\partial \mathcal L}{\partial W} = \sum_{b,t} e_t  u_t^\top .
 $$
 
 **State adjoint (reverse scan, `mpn_scan_backward`):** define
@@ -124,7 +124,7 @@ $\gamma_t = \partial \mathcal L / \partial m_t$. Then $\gamma_T = 0$ and, for
 $t = T, \dots, 1$,
 
 $$
-\gamma_{t-1} = (1 - d_t)\,\big(\lambda\, \gamma_t + \tfrac{\partial \mathcal L}{\partial u_t} \odot x_t\big).
+\gamma_{t-1} = (1 - d_t) \big(\lambda  \gamma_t + \tfrac{\partial \mathcal L}{\partial u_t} \odot x_t\big).
 $$
 
 The $(1 - d_t)$ factor cuts the gradient at a reset: $m_{t-1}$ was replaced
@@ -136,21 +136,21 @@ $$
 \frac{\partial \mathcal L}{\partial x_t}
 = \delta_t \odot (1 - s_t)
 + \frac{\partial \mathcal L}{\partial u_t} \odot (1 + \tilde m_{t-1})
-+ c\, \gamma_t .
++ c  \gamma_t .
 $$
 
 **Plasticity scalars** (summed over batch, time and features, then chained
 through the reparameterization in `mpn_scalar_grad`):
 
 $$
-\frac{\partial \mathcal L}{\partial \lambda} = \sum_{b,t,j} \gamma_{t,j}\, \tilde m_{t-1,j}, \qquad
-\frac{\partial \mathcal L}{\partial c} = \sum_{b,t,j} \gamma_{t,j}\, x_{t,j},
+\frac{\partial \mathcal L}{\partial \lambda} = \sum_{b,t,j} \gamma_{t,j}  \tilde m_{t-1,j}, \qquad
+\frac{\partial \mathcal L}{\partial c} = \sum_{b,t,j} \gamma_{t,j}  x_{t,j},
 $$
 
 $$
-\frac{\partial \mathcal L}{\partial \rho} = \frac{\partial \mathcal L}{\partial \lambda}\,
-\lambda_{\max}\,\sigma(\rho)\,(1 - \sigma(\rho)), \qquad
-\frac{\partial \mathcal L}{\partial \eta} = \frac{1}{\sqrt{H}}\,\frac{\partial \mathcal L}{\partial c}.
+\frac{\partial \mathcal L}{\partial \rho} = \frac{\partial \mathcal L}{\partial \lambda} 
+\lambda_{\max} \sigma(\rho) (1 - \sigma(\rho)), \qquad
+\frac{\partial \mathcal L}{\partial \eta} = \frac{1}{\sqrt{H}} \frac{\partial \mathcal L}{\partial c}.
 $$
 
 The forward scan caches the post-reset $\tilde m_{t-1}$ so the backward scan
