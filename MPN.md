@@ -57,11 +57,11 @@ The general MPN modulates a weight matrix with a fast, plastic matrix $M_t$:
 
 $$
 h_t = \phi\big((W \odot (1 + M_{t-1}))  x_t\big), \qquad
-M_t = \lambda M_{t-1} + \eta  (\text{post})   x_t^{\top}.
+M_t = \lambda M_{t-1} + \eta h_t  x_t^{\top}.
 $$
 
 In the **pre**-synaptic variant the Hebbian update depends only on the
-presynaptic activity, $M_t = \lambda M_{t-1} + c \mathbf{1} x_t^\top$, so (from
+presynaptic activity, $M_t = \lambda M_{t-1} + \eta \mathbf{1} x_t^\top$, so (from
 a zero or row-constant start) every row of $M$ is the same vector $m_t^\top$.
 The modulated product then factors:
 
