@@ -2098,12 +2098,36 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
 // OS reclaims memory/CUDA context on exit. This is the intended design.
 // All memory is allocated up front and static across training.
 // Skip cudaDeviceSynchronize/ncclCommDestroy: captured NCCL graphs deadlock DP.
+static void alloc_free(Allocator* a) {
+    if (a->mem) {
+        cudaFree(a->mem);
+        a->mem = NULL;
+    }
+}
+
 void close_pufferl(PuffeRL* p) {
     if (p->hypers.profile) {
         cudaProfilerStop();
     }
     nvmlShutdown();
     env_close(p->vec);
+    // Post-train eval builds a second PuffeRL in this process, so the trainer's
+    // big pools must go or large configs OOM in alloc_create. cudaFree syncs the
+    // device, so only do this single-GPU (DP: see note above).
+    if (p->hypers.world_size == 1) {
+        for (int b = 0; b < p->num_policies; b++) {
+            Policy* pol = &p->policies[b];
+            if (USE_BF16 && pol->master_weights.data) {
+                cudaFree(pol->master_weights.data);
+                pol->master_weights.data = NULL;
+            }
+            alloc_free(&pol->params_alloc);
+            alloc_free(&pol->activ_alloc);
+        }
+        alloc_free(&p->weight_alloc);
+        alloc_free(&p->grads_alloc);
+        alloc_free(&p->activ_alloc);
+    }
 }
 
 // Dashboard
@@ -3317,8 +3341,8 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         double ladder[SELFPLAY_MAX_LADDER];
         int rungs = puf_ini_get_list(ini, "selfplay", "eval_bots", ladder,
             SELFPLAY_MAX_LADDER);
-        // One PuffeRL for the whole ladder. close_pufferl frees nothing, so a
-        // trainer per rung is a leak. Swap bot_policy and restart instead.
+        // One PuffeRL for the whole ladder. close_pufferl only frees the big
+        // pools, so a trainer per rung still leaks. Swap bot_policy and restart instead.
         PuffeRL* ep = eval_make(ini, ctx, EVAL_SCORE, 0);
         float sum = 0;
         for (int i = 0; i < rungs; i++) {

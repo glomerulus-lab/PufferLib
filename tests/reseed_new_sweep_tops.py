@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
-"""Reseed-test top new-sweep solves (incl. <1s 0844 and baseline run 0000)."""
-import os, re, subprocess, sys, time, math
+"""Reseed-test top sweep runs: retrain each sweep_<ts>_<NNNN>.ini config with several seeds.
+
+Usage:
+  python3 tests/reseed_new_sweep_tops.py 511 601 840 598
+  python3 tests/reseed_new_sweep_tops.py 511 601 --seeds 11 22 33 --min-ts 1795000000000
+  python3 tests/reseed_new_sweep_tops.py 511 601 --dry-run   # show matched logs, don't train
+"""
+import argparse, os, re, subprocess, sys, time, math
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PUFFER = os.path.join(ROOT, "puffer")
 LOG_DIR = os.path.join(ROOT, "logs", "breakout")
-OLD_MAX = 1784664224203
+OLD_MAX = 1784664224203  # default --min-ts: ignore sweep logs older than this
 SEEDS = [11, 22, 33, 44, 55]
-
-# Top-of-list + near-misses under 1s from new sweep analysis
-TARGETS = [
-    (844, "only <1s solve (0.86s)"),
-    (0, "rank2 time — clipped old-unstable 0974"),
-    (606, "rank3 time 1.12s"),
-    (263, "rank4 time 1.15s"),
-    (617, "rank5 time 1.24s"),
-    (328, "near-miss 845.8 under 1s"),
-    (655, "near-miss 842.8 under 1s"),
-]
+TARGETS = []  # [(run_idx, note)], filled from argv
 
 HP_KEYS = [
-    "vec.total_agents", "vec.num_buffers", "vec.num_threads", "vec.gpu_env",
+    "vec.total_agents", "vec.num_buffers", "vec.num_threads",
     "env.frameskip", "policy.hidden_size", "policy.num_layers",
     "train.total_timesteps", "train.learning_rate", "train.gamma", "train.gae_lambda",
     "train.replay_ratio", "train.clip_coef", "train.vf_coef", "train.vf_clip_coef",
@@ -48,11 +44,14 @@ def parse_ini(path):
 
 
 def find_run(idx):
+    # Newest matching log wins if several sweeps after OLD_MAX reuse the index.
+    best = None
     for name in os.listdir(LOG_DIR):
         m = re.match(r"sweep_(\d+)_(\d+)\.ini$", name)
         if m and int(m.group(1)) > OLD_MAX and int(m.group(2)) == idx:
-            return os.path.join(LOG_DIR, name)
-    return None
+            if best is None or int(m.group(1)) > best[0]:
+                best = (int(m.group(1)), name)
+    return os.path.join(LOG_DIR, best[1]) if best else None
 
 
 def load_cfg(idx):
@@ -77,7 +76,6 @@ def load_cfg(idx):
         hp[k] = v
     hp.setdefault("vec.num_buffers", "1")
     hp.setdefault("vec.num_threads", "8")
-    hp.setdefault("vec.gpu_env", "1")
     hp.setdefault("train.vtrace_rho_clip", "1.0")
     hp.setdefault("train.vtrace_c_clip", "1.0")
     return {
@@ -85,6 +83,8 @@ def load_cfg(idx):
         "src": os.path.basename(path)[:-4],
         "async": int(float(d.get("base.async", "1"))),
         "sweep_score": max(sc),
+        "sweep_final": sc[-1],
+        "sweep_uptime": up[-1],
         "sweep_t850": t850,
         "hp": hp,
     }
@@ -104,13 +104,14 @@ def std(xs):
 def run_train(cfg, seed):
     run_id = f"newtop_{cfg['idx']:04d}_s{seed}"
     log_path = os.path.join(LOG_DIR, f"{run_id}.ini")
+    # Env is compiled into ./puffer; overrides must be --section.key=value.
     cmd = [
-        PUFFER, "train", "breakout",
-        f"base.run_id={run_id}",
-        f"base.seed={seed}",
-        f"base.async={cfg['async']}",
-        "base.checkpoint_interval=100000",
-        *[f"{k}={v}" for k, v in cfg["hp"].items()],
+        PUFFER, "train",
+        f"--base.run_id={run_id}",
+        f"--base.seed={seed}",
+        f"--base.async={cfg['async']}",
+        "--base.checkpoint_interval=100000",
+        *[f"--{k}={v}" for k, v in cfg["hp"].items()],
     ]
     t0 = time.time()
     proc = subprocess.run(cmd, cwd=ROOT, stdout=subprocess.DEVNULL,
@@ -125,29 +126,31 @@ def run_train(cfg, seed):
 
 
 def main():
+    global OLD_MAX, SEEDS
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("runs", type=int, nargs="+", help="sweep run indices (the _NNNN suffix)")
+    ap.add_argument("--seeds", type=int, nargs="+", default=SEEDS)
+    ap.add_argument("--min-ts", type=int, default=OLD_MAX,
+                    help="only consider sweep_<ts>_*.ini with ts greater than this")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the matched log and sweep result per run, then exit")
+    args = ap.parse_args()
+    OLD_MAX, SEEDS = args.min_ts, args.seeds
+    TARGETS[:] = [(i, f"sweep run {i:04d}") for i in args.runs]
+
     os.chdir(ROOT)
     results = []
-    print("=== Config snapshot (note run0 vs old 0974) ===\n")
-    # Old unstable #1 0974 (from prior sweep; log may be gone)
-    old0974 = {
-        "horizon": "16", "max_grad_norm": "2.9562645", "clip_coef": "1",
-        "learning_rate": "0.0778920427", "ent_coef": "0.00864126533",
-    }
-    cfg0 = load_cfg(0)
-    print("run 0000 is modified old-unstable 0974:")
-    print(f"  horizon:        16 → {cfg0['hp']['train.horizon']}")
-    print(f"  max_grad_norm:  2.96 → {cfg0['hp']['train.max_grad_norm']}")
-    print(f"  clip_coef:      1.0 → {cfg0['hp']['train.clip_coef']}")
-    print(f"  (lr/ent/gamma/gae/replay/vf/prio mostly unchanged from 0974)")
-    print()
-
     for idx, note in TARGETS:
         cfg = load_cfg(idx)
-        print(f"\n=== run {idx:04d} — {note} ===", flush=True)
-        print(f"  sweep: score={cfg['sweep_score']:.1f} t850={cfg['sweep_t850']}", flush=True)
+        print(f"\n=== run {idx:04d} — {cfg['src']} ===", flush=True)
+        print(f"  sweep: final score={cfg['sweep_final']:.1f} uptime={cfg['sweep_uptime']:.2f}s "
+              f"t850={cfg['sweep_t850']}", flush=True)
         print(f"  H={cfg['hp'].get('policy.hidden_size')} L={cfg['hp'].get('policy.num_layers')} "
               f"hzn={cfg['hp']['train.horizon']} clip={cfg['hp']['train.clip_coef']} "
               f"lr={cfg['hp']['train.learning_rate']} ent={cfg['hp']['train.ent_coef']}", flush=True)
+        if args.dry_run:
+            continue
         scores = []
         for seed in SEEDS:
             print(f"  seed={seed}", flush=True)
@@ -170,13 +173,16 @@ def main():
                   f"all≥800={sum(s>=800 for s in scores)}/{len(scores)} "
                   f"all≥850={sum(s>=850 for s in scores)}/{len(scores)}", flush=True)
 
+    if args.dry_run:
+        return 0
     print("\n" + "=" * 72)
     print("SUMMARY")
     print("=" * 72)
     print(f"{'run':>5} {'sweep_t':>8} {'mean':>7} {'std':>7} {'min':>7} {'max':>7} "
           f"{'≥800':>5} {'≥850':>5}  note")
     for r in results:
-        print(f"{r['idx']:5d} {r['sweep_t850']:8.3f} {r['mean']:7.1f} {r['std']:7.1f} "
+        t850 = r['sweep_t850'] if r['sweep_t850'] is not None else float('nan')
+        print(f"{r['idx']:5d} {t850:8.3f} {r['mean']:7.1f} {r['std']:7.1f} "
               f"{r['min']:7.1f} {r['max']:7.1f} "
               f"{sum(s>=800 for s in r['scores']):2d}/{len(r['scores'])} "
               f"{sum(s>=850 for s in r['scores']):2d}/{len(r['scores'])}  {r['note']}")
