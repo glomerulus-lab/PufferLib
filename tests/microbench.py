@@ -142,18 +142,18 @@ def time_sps(func, *args, backward=False):
 
     return f'{sps/1e9:.2f} B'
 
-def mpn_gate(state, gate, hidden):
+def mingru_gate(state, gate, hidden):
     hidden = torch.where(hidden >= 0, hidden + 0.5, hidden.sigmoid())
     gate = gate.sigmoid()
     out = torch.lerp(state, hidden, gate)
     return out
 
-def test_mpn_gate():
+def test_mingru_gate():
     state = torch.randn(BR, H)
     gate = torch.randn(BR, H)
     hidden = torch.randn(BR, H)
-    print('mpn_gate')
-    test_kernel(mpn_gate, _C.mpn_gate, state, gate, hidden)
+    print('mingru_gate')
+    test_kernel(mingru_gate, _C.mingru_gate, state, gate, hidden)
 
 def log_coeffs_and_values(gate, hidden):
     log_coeffs = -torch.nn.functional.softplus(gate)
@@ -355,7 +355,7 @@ def test_sample_logits():
     print(f'\tForward sps: {py_sps} (naive) {cpp_sps} (C++)')
 
 if __name__ == '__main__':
-    #test_mpn_gate()
+    #test_mingru_gate()
     #test_log_coeffs_and_values()
     #test_logcumsumexp()
     #test_fused_scan()

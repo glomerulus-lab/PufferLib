@@ -1,13 +1,32 @@
 # MPN: Multi-Plasticity Network layer
 
-This document describes the recurrent layer that replaces MinGRU on the `mpn`
-branch. It is the **MPNpre** variant of the multi-plasticity network from
-Aitken & Mihalas (2023), *eLife* 12:e83035 (Eq. 1 and Eq. 13), with PufferLib's
-gated highway connection added on top.
+This document describes the **MPNpre** recurrent layer: the presynaptic variant
+of the multi-plasticity network from Aitken & Mihalas (2023), *eLife* 12:e83035
+(Eq. 1 and Eq. 13), with PufferLib's gated highway connection added on top.
 
-Implementation: `src/algo.cu` (`mpn_*` kernels and `mpn_forward`,
-`mpn_forward_train`, `mpn_backward`), CPU inference mirror in
-`src/puffercpu.c` (`mpn`), float64 reference in `tests/test_mpn.py`.
+## Selecting the recurrent network
+
+The trainer and the CPU inference binaries pick the recurrent core at runtime
+from `[policy] network` (default `mpn_pre`, set in `config/default.ini`):
+
+| `network` | Implementation | State per layer per agent |
+|---|---|---|
+| `mingru` | `src/networks/mingru.cu` (the 5.0 MinGRU) | $H$ |
+| `mpn_pre` | `src/networks/mpn_pre.cu` (this document) | $H$ |
+| `mpn` | full MPN (not implemented yet) | $H^2$ |
+
+`build_arch` in `src/algo.cu` fills the `Network` vtable via `make_network`,
+which also sets `state_size`; the trainer allocates recurrent state as
+`(num_layers, agents, state_size)`. On CPU, `src/puffercpu.c` exposes one
+`RNN` type (`make_rnn`, `rnn_forward`, `rnn_zero_term`, `rnn_reset`,
+`rnn_weight_count`) that every env net uses. Standalone demos that do not read
+the ini take the network explicitly: `--network NAME` for the OSRS viewers and
+`NH_NETWORK=NAME` for the NetHack demo (both default to `mpn_pre`).
+
+Implementation of MPNpre: `src/networks/mpn_pre.cu` (`mpnpre_*` kernels and
+`mpnpre_forward`, `mpnpre_forward_train`, `mpnpre_backward`; shared constants in
+`src/networks/mpn_common.cu`), CPU inference mirror in `src/puffercpu.c`
+(`mpnpre_layer`), float64 reference in `tests/test_mpn.py`.
 
 ## Notation
 
@@ -99,12 +118,12 @@ it scales the inputs to the candidate $a_t$ and to the gate $g_t$ alike.
 
 ## Training: truncated BPTT over the horizon
 
-`mpn_forward_train` processes a segment of $T$ steps (the horizon) starting
+`mpnpre_forward_train` processes a segment of $T$ steps (the horizon) starting
 from the stored state $m_0$. Gradients do not flow into $m_0$, and the final
 state $m_T$ receives no gradient (truncated BPTT). Let
 $\delta_t = \partial \mathcal L / \partial y_t$ and $h_t = \tanh(a_t)$.
 
-**Output gate (time-parallel, `mpn_post_backward`):**
+**Output gate (time-parallel, `mpnpre_post_backward`):**
 
 $$
 \frac{\partial \mathcal L}{\partial a_t} = \delta_t \odot s_t \odot (1 - h_t^2), \qquad
@@ -119,7 +138,7 @@ $$
 \frac{\partial \mathcal L}{\partial W} = \sum_{b,t} e_t  u_t^\top .
 $$
 
-**State adjoint (reverse scan, `mpn_scan_backward`):** define
+**State adjoint (reverse scan, `mpnpre_scan_backward`):** define
 $\gamma_t = \partial \mathcal L / \partial m_t$. Then $\gamma_T = 0$ and, for
 $t = T, \dots, 1$,
 
@@ -140,7 +159,7 @@ $$
 $$
 
 **Plasticity scalars** (summed over batch, time and features, then chained
-through the reparameterization in `mpn_scalar_grad`):
+through the reparameterization in `mpnpre_scalar_grad`):
 
 $$
 \frac{\partial \mathcal L}{\partial \lambda} = \sum_{b,t,j} \gamma_{t,j}  \tilde m_{t-1,j}, \qquad
@@ -164,15 +183,18 @@ can reuse it without recomputing the recurrence.
   16-byte layout. Their gradients are always zero. The order ($W$, then
   scalars, per layer) is shared by the CUDA trainer, the gradient buffers and
   the CPU weight loader.
-- **Rollout vs. training:** during rollout (`mpn_forward`) the state is
-  updated in place one step at a time (`mpn_step_pre`). The trainer zeros the
+- **Rollout vs. training:** during rollout (`mpnpre_forward`) the state is
+  updated in place one step at a time (`mpnpre_step_pre`). The trainer zeros the
   state for agents whose terminal flag is set (`zero_term_state`) before the
   post-terminal observation is encoded, which matches the in-scan
   $(1-d_t)$ reset used in training.
 - **Precision:** in the training scan, $m$ is rounded to `precision_t` after
   every step, so in bf16 builds the training forward reproduces exactly the
   state sequence the rollout stored.
-- **Checkpoints** from the MinGRU network are not compatible.
+- **Checkpoints** are network-specific: load a checkpoint with the same
+  `[policy] network` it was trained with. MinGRU and MPNpre have different
+  parameter counts ($3H^2$ vs. $2H^2 + 8$ per layer), so a mismatch fails the
+  weight-count check.
 
 ## Reference
 

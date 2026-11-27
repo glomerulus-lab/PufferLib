@@ -1,11 +1,11 @@
-// CPU minimal policy: entity encoder + MPN + decoder.
+// CPU minimal policy: entity encoder + RNN + decoder.
 // Weight order matches CUDA weights_create / reg_params:
 //   encoder input_w (16 x 6), encoder output_w (hidden x 16),
-//   decoder ((9+5+1) x hidden), mpn layers (W 2*hidden x hidden, then MPN_SCALARS each).
+//   decoder ((9+5+1) x hidden), recurrent layers (per [policy] network; see RNN in puffercpu.c).
 // Forward matches ocean/minimal/minimal.cu:
 //   materialize 16 entities [self(2) | point_i(4)], Linear 6->16, ReLU,
-//   Linear 16->hidden, max-pool over the 16 points, then MPN + decoder.
-// Include puffercpu.c first (Linear / ReLU / MPN).
+//   Linear 16->hidden, max-pool over the 16 points, then RNN + decoder.
+// Include puffercpu.c first (Linear / ReLU / RNN).
 
 #define ME_SELF_DIM 2
 #define ME_POINT_DIM 4
@@ -29,7 +29,7 @@ struct MinimalNet {
     ReLU* entity_relu;
     Linear* out_fc;
     Linear* decoder;
-    MPN* mpn;
+    RNN* rnn;
     Multidiscrete* multidiscrete;
 };
 
@@ -37,15 +37,15 @@ static inline int puf_me_align8(int n) {
     return (n + 7) & ~7;
 }
 
-static inline int minimal_weight_count(int hidden, int layers) {
+static inline int minimal_weight_count(NetworkType network, int hidden, int layers) {
     int n = 0;
     n = puf_me_align8(n + ME_ENTITY_HIDDEN * ME_ENTITY_IN);
     n = puf_me_align8(n + hidden * ME_ENTITY_HIDDEN);
     n = puf_me_align8(n + (9 + 5 + 1) * hidden);
-    return mpn_weight_count(n, hidden, layers);
+    return rnn_weight_count(network, n, hidden, layers);
 }
 
-static inline MinimalNet* init_minimal_net(Weights* weights, int num_agents,
+static inline MinimalNet* init_minimal_net(Weights* weights, NetworkType network, int num_agents,
         int hidden, int layers) {
     MinimalNet* net = (MinimalNet*)calloc(1, sizeof(MinimalNet));
     net->num_agents = num_agents;
@@ -59,7 +59,7 @@ static inline MinimalNet* init_minimal_net(Weights* weights, int num_agents,
     net->out_fc = make_linear(weights, num_agents * ME_NUM_POINTS,
         ME_ENTITY_HIDDEN, hidden);
     net->decoder = make_linear(weights, num_agents, hidden, 9 + 5 + 1);
-    net->mpn = make_mpn(weights, num_agents, hidden, layers);
+    net->rnn = make_rnn(weights, network, num_agents, hidden, layers);
     int logit_sizes[ME_NUM_ATNS] = {9, 5};
     net->multidiscrete = make_multidiscrete(num_agents, logit_sizes, ME_NUM_ATNS);
     return net;
@@ -72,7 +72,7 @@ static inline void free_minimal_net(MinimalNet* net) {
     free(net->entity_relu);
     free(net->out_fc);
     free(net->decoder);
-    free_mpn(net->mpn);
+    free_rnn(net->rnn);
     free(net->multidiscrete);
     free(net);
 }
@@ -99,9 +99,9 @@ static inline void minimal_encode(MinimalNet* net, const float* observations) {
 
 static inline void forward_minimal(MinimalNet* net, const float* observations,
         float* terminals, float* actions) {
-    mpn_zero_term(net->mpn, terminals);
+    rnn_zero_term(net->rnn, terminals);
     minimal_encode(net, observations);
-    mpn(net->mpn, net->encoded);
-    linear(net->decoder, net->mpn->output);
+    rnn_forward(net->rnn, net->encoded);
+    linear(net->decoder, net->rnn->output);
     multidiscrete(net->multidiscrete, net->decoder->output, actions, 0, NULL);
 }

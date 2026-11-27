@@ -198,7 +198,7 @@ struct VisualNet {
     float* obs;
     Linear* encoder;
     EntityEncoder* entity_encoder;
-    MPN* mpn;
+    RNN* rnn;
     Linear* decoder;
     float* log_std;
     int is_continuous;
@@ -211,7 +211,7 @@ void visual_net_free(VisualNet* net) {
     if (net->encoder) free(net->encoder);
     free(net->entity_encoder);
     free(net->decoder);
-    free_mpn(net->mpn);
+    free_rnn(net->rnn);
     if (net->multidiscrete) free(net->multidiscrete);
     free(net);
 }

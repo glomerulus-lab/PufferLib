@@ -297,6 +297,7 @@ typedef struct {
     int horizon;
     int total_agents;
     int num_buffers;
+    NetworkType network;
     int hidden_size;
     int num_layers;
     float lr;
@@ -1782,6 +1783,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         .horizon = puf_ini_get(ini, "train", "horizon"),
         .total_agents = puf_ini_get(ini, "vec", "total_agents"),
         .num_buffers = puf_ini_get(ini, "vec", "num_buffers"),
+        .network = parse_network_type(puf_ini_get_str(ini, "policy", "network")),
         .hidden_size = puf_ini_get(ini, "policy", "hidden_size"),
         .num_layers = puf_ini_get(ini, "policy", "num_layers"),
         .lr = puf_ini_get(ini, "train", "learning_rate"),
@@ -1945,8 +1947,10 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         int slice = vec->policy_layout[b + 1] - vec->policy_layout[b];
         assert(slice > 0 && "policy has no agents");
 
-        pol->arch = build_arch(input_size, h, L,
+        // Frozen (historical) policies share the trainable policy's network type.
+        pol->arch = build_arch(hypers.network, input_size, h, L,
             decoder_output_size, is_continuous, hypers.horizon);
+        int S = pol->arch.network.state_size;
         pol->weights = weights_create(&pol->arch, &pol->params_alloc);
         Allocator* aalloc = pol->frozen ? &pol->activ_alloc : acts;
         pol->buf_acts = (Activations*)calloc(
@@ -1955,13 +1959,14 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         for (int i = 0; i < num_buffers; i++) {
             pol->buf_acts[i] = arch_reg_rollout(
                 &pol->arch, pol->weights, aalloc, slice);
-            pol->buffer_states[i] = {.shape = {L, slice, h}};
+            pol->buffer_states[i] = {.shape = {L, slice, S}};
             alloc_register(aalloc, &pol->buffer_states[i]);
         }
     }
 
     // Train-only extras on policies[0] (trainable).
     Policy* primary = &pufferl->policies[0];
+    int state_size = primary->arch.network.state_size;
     if (hypers.async) {
         pufferl->actor_weights = weights_create(
             &primary->arch, &pufferl->weight_alloc);
@@ -1978,7 +1983,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     // Carry path: per-slot initial RNN states. reset_every_horizon zeros train_state.
     if (!hypers.reset_every_horizon) {
         pufferl->rollouts.initial_states = {
-            .shape = {async_slots, num_layers, total_agents, hidden_size}};
+            .shape = {async_slots, num_layers, total_agents, state_size}};
         alloc_register(acts, &pufferl->rollouts.initial_states);
     }
     register_train_buffers(pufferl->train_buf, acts, minibatch_segments, horizon);
@@ -1986,7 +1991,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         acts, total_agents, horizon, input_size, num_action_heads, act_n);
     register_ppo_buffers(pufferl->ppo_bufs, acts, minibatch_segments,
         hypers.horizon, decoder_output_size, is_continuous);
-    pufferl->train_state = {.shape = {num_layers, total_agents, hidden_size}};
+    pufferl->train_state = {.shape = {num_layers, total_agents, state_size}};
     alloc_register(acts, &pufferl->train_state);
 
     cudaMalloc((void**)&pufferl->rng_offset, (num_buffers + 1) * sizeof(long));

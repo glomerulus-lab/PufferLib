@@ -1,4 +1,4 @@
-"""Check the MPN network (src/algo.cu mpn_*, src/puffercpu.c mpn) against a
+"""Check the MPN-pre network (src/networks/mpn_pre.cu, src/puffercpu.c RNN) against a
 float64 PyTorch reference of the MPNpre + highway layer:
 
     lambda = 0.95 * sigmoid(rho),  c = eta / sqrt(H)
@@ -12,7 +12,7 @@ Checks:
       gradients (W, rho, eta, x) vs autograd, rollout-step vs train parity,
       final state.
   bf16 (bf16 build):  rollout vs train parity and loose agreement with reference.
-  cpu:                src/puffercpu.c mpn() step vs reference (no GPU needed).
+  cpu:                src/puffercpu.c rnn_forward() (network=mpn_pre) step vs reference.
 
 Run: python tests/test_mpn.py [cuda] [bf16] [cpu]   (default: all three)
 """
@@ -232,13 +232,17 @@ class CWeights(ctypes.Structure):
                 ("size", ctypes.c_int), ("idx", ctypes.c_int)]
 
 
-class CMPN(ctypes.Structure):
-    _fields_ = [("state", ctypes.POINTER(ctypes.c_float)),
+NETWORK_MPN_PRE = 1  # NetworkType in src/puffercpu.c
+
+
+class CRNN(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int),
+                ("state", ctypes.POINTER(ctypes.c_float)),
                 ("output", ctypes.POINTER(ctypes.c_float)),
                 ("u", ctypes.POINTER(ctypes.c_float)),
                 ("proj", VP), ("scalars", VP),
                 ("batch_size", ctypes.c_int), ("hidden_size", ctypes.c_int),
-                ("num_layers", ctypes.c_int)]
+                ("num_layers", ctypes.c_int), ("state_size", ctypes.c_int)]
 
 
 def run_cpu(rep):
@@ -249,10 +253,10 @@ def run_cpu(rep):
     print("building:", " ".join(cmd))
     subprocess.check_call(cmd)
     lib = ctypes.CDLL(so)
-    lib.make_mpn.restype = ctypes.POINTER(CMPN)
-    lib.make_mpn.argtypes = [ctypes.POINTER(CWeights)] + [ctypes.c_int] * 3
-    lib.mpn.argtypes = [ctypes.POINTER(CMPN), VP]
-    lib.mpn_zero_term.argtypes = [ctypes.POINTER(CMPN), VP]
+    lib.make_rnn.restype = ctypes.POINTER(CRNN)
+    lib.make_rnn.argtypes = [ctypes.POINTER(CWeights)] + [ctypes.c_int] * 4
+    lib.rnn_forward.argtypes = [ctypes.POINTER(CRNN), VP]
+    lib.rnn_zero_term.argtypes = [ctypes.POINTER(CRNN), VP]
 
     B, T, H, L = 5, 23, 48, 3
     x, state0, term, _, rhos, etas = make_case(B, T, H, L, seed=1)
@@ -271,7 +275,7 @@ def run_cpu(rep):
     flat = torch.cat(chunks).float().contiguous()
     weights = CWeights(ctypes.cast(flat.data_ptr(), ctypes.POINTER(ctypes.c_float)),
                        flat.numel(), 0)
-    net = lib.make_mpn(ctypes.byref(weights), B, H, L)
+    net = lib.make_rnn(ctypes.byref(weights), NETWORK_MPN_PRE, B, H, L)
     rep.check("cpu weights consumed == file size", abs(weights.idx - flat.numel()), 0)
 
     st = torch.from_numpy(
@@ -282,14 +286,14 @@ def run_cpu(rep):
     out = torch.zeros(B, T, H)
     for t in range(T):
         tt = term[:, t].float().contiguous()
-        lib.mpn_zero_term(net, VP(tt.data_ptr()))
+        lib.rnn_zero_term(net, VP(tt.data_ptr()))
         xt = xf[:, t].contiguous()
-        lib.mpn(net, VP(xt.data_ptr()))
+        lib.rnn_forward(net, VP(xt.data_ptr()))
         out[:, t] = torch.from_numpy(outv.copy())
 
     ref_out, ref_state = ref_forward(x, state0, term, Ws, rhos, etas)
     print("[cpu] forward")
-    rep.check("cpu mpn() vs reference", rel_err(out, ref_out), 1e-5)
+    rep.check("cpu rnn_forward(mpn_pre) vs reference", rel_err(out, ref_out), 1e-5)
     rep.check("cpu final state vs reference", rel_err(st, ref_state), 1e-5)
 
 

@@ -1,8 +1,8 @@
-// CPU Craftax encoder: bag-of-embeddings + projection, then MPN + decoder.
-// Weight order matches CUDA create_craftax_encoder + algo decoder/mpn:
+// CPU Craftax encoder: bag-of-embeddings + projection, then RNN + decoder.
+// Weight order matches CUDA create_craftax_encoder + algo decoder/network:
 //   embed (154 x 16), proj (hidden x 1635), decoder ((ATN_DIM+1) x hidden),
-//   mpn layers (W 2*hidden x hidden, then MPN_SCALARS each).
-// Include puffercpu.c first (Linear / MPN / multidiscrete).
+//   recurrent layers (per [policy] network; see RNN in puffercpu.c).
+// Include puffercpu.c first (Linear / RNN / multidiscrete).
 
 #define CX_NUM_CELLS (OBS_ROWS * OBS_COLS)
 #define CX_CHANNELS 8
@@ -25,7 +25,7 @@ typedef struct CraftaxNet {
     float* concat;
     Linear* proj;
     Linear* decoder;
-    MPN* mpn;
+    RNN* rnn;
     Multidiscrete* multidiscrete;
 } CraftaxNet;
 
@@ -33,15 +33,15 @@ static inline int puf_cx_align8(int n) {
     return (n + 7) & ~7;
 }
 
-static inline int craftax_weight_count(int hidden, int layers) {
+static inline int craftax_weight_count(NetworkType network, int hidden, int layers) {
     int n = 0;
     n = puf_cx_align8(n + CX_VOCAB_TOTAL * CX_EMB_DIM);
     n = puf_cx_align8(n + hidden * CX_CONCAT);
     n = puf_cx_align8(n + (ATN_DIM + 1) * hidden);
-    return mpn_weight_count(n, hidden, layers);
+    return rnn_weight_count(network, n, hidden, layers);
 }
 
-static inline CraftaxNet* init_craftax_net(Weights* weights, int num_agents,
+static inline CraftaxNet* init_craftax_net(Weights* weights, NetworkType network, int num_agents,
         int hidden, int layers) {
     CraftaxNet* net = (CraftaxNet*)calloc(1, sizeof(CraftaxNet));
     net->num_agents = num_agents;
@@ -51,7 +51,7 @@ static inline CraftaxNet* init_craftax_net(Weights* weights, int num_agents,
     net->concat = (float*)calloc((size_t)num_agents * CX_CONCAT, sizeof(float));
     net->proj = make_linear(weights, num_agents, CX_CONCAT, hidden);
     net->decoder = make_linear(weights, num_agents, hidden, ATN_DIM + 1);
-    net->mpn = make_mpn(weights, num_agents, hidden, layers);
+    net->rnn = make_rnn(weights, network, num_agents, hidden, layers);
     int logit_sizes[1] = {ATN_DIM};
     net->multidiscrete = make_multidiscrete(num_agents, logit_sizes, 1);
     return net;
@@ -87,10 +87,10 @@ static inline void craftax_encode(CraftaxNet* net, const float* observations) {
 
 static inline void forward_craftax(CraftaxNet* net, const float* observations,
         float* terminals, float* actions, const unsigned char* mask) {
-    mpn_zero_term(net->mpn, terminals);
+    rnn_zero_term(net->rnn, terminals);
     craftax_encode(net, observations);
-    mpn(net->mpn, net->proj->output);
-    linear(net->decoder, net->mpn->output);
+    rnn_forward(net->rnn, net->proj->output);
+    linear(net->decoder, net->rnn->output);
     multidiscrete(net->multidiscrete, net->decoder->output, actions,
         net->greedy, mask);
 }

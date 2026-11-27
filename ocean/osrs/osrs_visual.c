@@ -843,6 +843,7 @@ typedef struct {
     int entity_encoder;
     int hidden_size;
     int num_layers;
+    NetworkType network;
 } VisualPolicyModelShape;
 
 typedef struct {
@@ -892,6 +893,7 @@ static int64_t visual_policy_advance_weight_offset(
 }
 
 static int64_t visual_policy_expected_weight_count(
+    NetworkType network,
     int input_size,
     int hidden_size,
     int num_layers,
@@ -925,8 +927,10 @@ static int64_t visual_policy_expected_weight_count(
     }
     for (int i = 0; i < num_layers; i++) {
         total = visual_policy_advance_weight_offset(
-            total, (int64_t)2 * hidden_size * hidden_size);
-        total = visual_policy_advance_weight_offset(total, MPN_SCALARS);
+            total, (int64_t)rnn_proj_rows(network, hidden_size) * hidden_size);
+        if (network != NETWORK_MINGRU) {
+            total = visual_policy_advance_weight_offset(total, MPN_SCALARS);
+        }
     }
     return total;
 }
@@ -939,6 +943,7 @@ static VisualPolicyModelShape visual_policy_select_model_shape(
     const VisualPolicy* policy,
     const EncounterDef* edef,
     const EntityEncoderDescriptor* descriptor,
+    NetworkType network,
     int cli_hidden_size,
     int cli_num_layers,
     int cli_entity_encoder
@@ -963,11 +968,11 @@ static VisualPolicyModelShape visual_policy_select_model_shape(
                         int input_size = variant ? full_input_size : obs_input_size;
                         if (enc && input_size != edef->obs_size) continue;
                         int64_t expected = visual_policy_expected_weight_count(
-                            input_size, hs, layers, policy->action_dims,
+                            network, input_size, hs, layers, policy->action_dims,
                             policy->num_action_heads, value_heads, enc, descriptor);
                         if (expected != file_weights) continue;
                         match = (VisualPolicyModelShape){
-                            input_size, value_heads, enc, hs, layers};
+                            input_size, value_heads, enc, hs, layers, network};
                         matches++;
                         if (matches <= 8) {
                             fprintf(stderr,
@@ -984,9 +989,10 @@ static VisualPolicyModelShape visual_policy_select_model_shape(
     if (matches == 0) {
         fprintf(stderr,
             "policy: %s model shape mismatch: file=%lld floats matches no architecture"
-            " (obs=%d mask=%d, scanned hs 128..4096, layers 1..8, entity 0..%d%s)\n",
-            edef->name, (long long)file_weights, policy->obs_size, policy->mask_size,
-            enc_max,
+            " (network=%s, obs=%d mask=%d, scanned hs 128..4096, layers 1..8, entity 0..%d%s;"
+            " pass --network if the checkpoint used another network)\n",
+            edef->name, (long long)file_weights, NETWORK_NAMES[network],
+            policy->obs_size, policy->mask_size, enc_max,
             (cli_hidden_size > 0 || cli_num_layers > 0 || cli_entity_encoder > 0)
                 ? " within the given CLI constraints" : "");
         abort();
@@ -1021,6 +1027,7 @@ static void visual_policy_assert_offset(
 
 static VisualNet* visual_policy_make_puffernet(
     Weights* weights,
+    NetworkType network,
     int input_dim,
     int hidden_dim,
     int num_layers,
@@ -1087,10 +1094,13 @@ static VisualNet* visual_policy_make_puffernet(
     int64_t off_after_logstd = off;
     for (int l = 0; l < num_layers; l++) {
         char name[32];
-        snprintf(name, sizeof(name), "mpn.proj[%d]", l);
-        off = visual_policy_layout_tensor(name, off, (int64_t)2 * hidden_dim * hidden_dim);
-        snprintf(name, sizeof(name), "mpn.scalars[%d]", l);
-        off = visual_policy_layout_tensor(name, off, MPN_SCALARS);
+        snprintf(name, sizeof(name), "rnn.proj[%d]", l);
+        off = visual_policy_layout_tensor(name, off,
+            (int64_t)rnn_proj_rows(network, hidden_dim) * hidden_dim);
+        if (network != NETWORK_MINGRU) {
+            snprintf(name, sizeof(name), "rnn.scalars[%d]", l);
+            off = visual_policy_layout_tensor(name, off, MPN_SCALARS);
+        }
     }
     int64_t off_total = off;
 
@@ -1110,8 +1120,8 @@ static VisualNet* visual_policy_make_puffernet(
         visual_policy_assert_offset("logstd", weights, off_after_logstd);
     }
 
-    net->mpn = make_mpn(weights, 1, hidden_dim, num_layers);
-    visual_policy_assert_offset("mpn", weights, off_total);
+    net->rnn = make_rnn(weights, network, 1, hidden_dim, num_layers);
+    visual_policy_assert_offset("rnn", weights, off_total);
 
     if (!net->is_continuous) {
         net->multidiscrete = make_multidiscrete(1, action_dims, num_action_heads);
@@ -1128,6 +1138,8 @@ static float visual_policy_next_uniform(VisualPolicy* policy) {
     return (float)((visual_policy_next_u32(policy) >> 8) * (1.0 / 16777216.0));
 }
 
+// Recurrent network the checkpoint was trained with ([policy] network); --network.
+static NetworkType g_cli_network = NETWORK_MPN_PRE;
 static int g_cli_hidden_size = -1;
 static int g_cli_num_layers = -1;
 static int g_cli_entity_encoder = 0;
@@ -1148,6 +1160,7 @@ static void visual_policy_init(
     const char* model_path,
     VisualPolicyMode mode,
     uint32_t seed,
+    NetworkType network,
     int cli_hidden_size,
     int cli_num_layers,
     int cli_entity_encoder
@@ -1185,15 +1198,17 @@ static void visual_policy_init(
         abort();
     }
     VisualPolicyModelShape model_shape = visual_policy_select_model_shape(
-        policy, edef, descriptor,
+        policy, edef, descriptor, network,
         cli_hidden_size, cli_num_layers, cli_entity_encoder);
     fprintf(stderr,
-        "policy: %s arch resolved hs=%d layers=%d entity=%d input=%d value_heads=%d\n",
-        edef->name, model_shape.hidden_size, model_shape.num_layers,
+        "policy: %s arch resolved network=%s hs=%d layers=%d entity=%d input=%d value_heads=%d\n",
+        edef->name, NETWORK_NAMES[model_shape.network],
+        model_shape.hidden_size, model_shape.num_layers,
         model_shape.entity_encoder, model_shape.input_size,
         model_shape.decoder_value_heads);
     policy->net = visual_policy_make_puffernet(
         policy->weights,
+        model_shape.network,
         model_shape.input_size,
         model_shape.hidden_size,
         model_shape.num_layers,
@@ -1229,12 +1244,8 @@ static void __attribute__((unused)) visual_policy_destroy(VisualPolicy* policy) 
 }
 
 static void visual_policy_reset_recurrent(VisualPolicy* policy) {
-    if (!policy || !policy->net || !policy->net->mpn) return;
-    memset(policy->net->mpn->state, 0,
-        (size_t)policy->net->mpn->num_layers *
-        (size_t)policy->net->mpn->batch_size *
-        (size_t)policy->net->mpn->hidden_size *
-        sizeof(float));
+    if (!policy || !policy->net || !policy->net->rnn) return;
+    rnn_reset(policy->net->rnn);
 }
 
 static int visual_policy_argmax_masked(const float* logits, const float* mask, int dim) {
@@ -1288,8 +1299,8 @@ static void visual_policy_actions_from_obs(VisualPolicy* policy, int* actions) {
         linear(policy->net->encoder, policy->obs);
         encoded = policy->net->encoder->output;
     }
-    mpn(policy->net->mpn, encoded);
-    linear(policy->net->decoder, policy->net->mpn->output);
+    rnn_forward(policy->net->rnn, encoded);
+    linear(policy->net->decoder, policy->net->rnn->output);
 
     const float* logits = policy->net->decoder->output;
     const float* mask = policy->obs + policy->obs_size;
@@ -1356,7 +1367,7 @@ static void run_policy_profile(
 
     VisualPolicy policy;
     visual_policy_init(&policy, edef, model_path, policy_mode, policy_seed,
-        g_cli_hidden_size, g_cli_num_layers, g_cli_entity_encoder);
+        g_cli_network, g_cli_hidden_size, g_cli_num_layers, g_cli_entity_encoder);
     if (!policy.enabled) abort();
 
 #ifdef COLO_PROFILE_ENABLED
@@ -1769,7 +1780,8 @@ static void run_metrics(
 
     VisualPolicy policy;
     visual_policy_init(&policy, edef, model_path, policy_mode, policy_seed,
-                       g_cli_hidden_size, g_cli_num_layers, g_cli_entity_encoder);
+                       g_cli_network, g_cli_hidden_size, g_cli_num_layers,
+                       g_cli_entity_encoder);
     if (!policy.enabled) {
         fprintf(stderr, "metrics mode: failed to load model (pass --model <path>)\n");
         return;
@@ -2182,6 +2194,7 @@ static void run_visual(
         model_path,
         policy_mode,
         policy_seed,
+        g_cli_network,
         g_cli_hidden_size,
         g_cli_num_layers,
         g_cli_entity_encoder);
@@ -2370,6 +2383,8 @@ int main(int argc, char** argv) {
             policy_mode_name = argv[++i];
         else if (strcmp(argv[i], "--policy-seed") == 0 && i + 1 < argc)
             policy_seed = visual_policy_parse_seed(argv[++i]);
+        else if (strcmp(argv[i], "--network") == 0 && i + 1 < argc)
+            g_cli_network = parse_network_type(argv[++i]);
         else if (strcmp(argv[i], "--hidden-size") == 0 && i + 1 < argc)
             g_cli_hidden_size = atoi(argv[++i]);
         else if (strcmp(argv[i], "--num-layers") == 0 && i + 1 < argc)

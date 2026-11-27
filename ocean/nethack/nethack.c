@@ -120,8 +120,8 @@ static void env_close(Nethack* env) {
     free(a->action_mask);
 }
 
-// CPU port of the CUDA encoder (ocean/nethack/nethack.cu) + puffernet MPN/decoder;
-// weight order matches param registration: encoder, decoder, mpn
+// CPU port of the CUDA encoder (ocean/nethack/nethack.cu) + puffernet RNN/decoder;
+// weight order matches param registration: encoder, decoder, recurrent layers
 #define DEMO_VOCAB 5977
 #define DEMO_EMBED 32
 #define DEMO_BL_FEAT (25 + 7 + 13 + NETHACK_NUM_ACTIONS + NETHACK_NUM_OCLASSES + 2 + 8 + 2 + 2 \
@@ -209,7 +209,8 @@ typedef struct {
     float *dec_q; // (DEMO_QDIM, H): thirteen stacked 16-dim queries (12 item + spell)
     float *dec_k; // (16, 16): key projection over slot features
     float *dec_tau; // (12,): per-head log cosine temperature
-    MPN* mpn;
+    RNN* rnn;
+    NetworkType network;
     Multidiscrete* md;
     int hidden_size, num_layers, num_actions;
     float *loc2_w, *loc2_b; float loc_h1[DEMO_LOC_H1];
@@ -228,8 +229,10 @@ typedef struct {
     float* hidden; // (hidden_size)
 } NethackNet;
 
-// (hidden, layers) from the checkpoint float count:
-//   total = ENC_FIXED + H*(DEMO_CONCAT + 1) + H*(32 + 192) + DEC_FIXED + L * (2*H*H + MPN_SCALARS)
+// (hidden, layers) from the checkpoint float count, for the network the checkpoint
+// was trained with (NH_NETWORK=mingru|mpn_pre|mpn, default mpn_pre):
+//   total = ENC_FIXED + H*(DEMO_CONCAT + 1) + H*(32 + 192) + DEC_FIXED + L * per_layer
+//   per_layer = rnn_weight_count(network, 0, H, 1)
 // All tensors land on 8-float boundaries; only tau (12) needs padding (+4).
 #define DEMO_ENC_FIXED (DEMO_VOCAB*DEMO_EMBED \
                         + NH_GM_NKIND*DEMO_EMBED + NH_GM_NSUB*DEMO_EMBED \
@@ -254,12 +257,18 @@ typedef struct {
                              + DEMO_MV*DEMO_MV + DEMO_MV))
 #define DEMO_DEC_FIXED (DEMO_INV_HID*DEMO_INV_HID + 16) // k_w + tau padded 12->16
 // ambiguities are possible; prefer the fewest layers (real configs have <= 8)
-static int demo_infer_arch(int total, int* hidden, int* layers, int* actions) {
+static NetworkType demo_network(void) {
+    const char* e = getenv("NH_NETWORK");
+    return (e && e[0]) ? parse_network_type(e) : NETWORK_MPN_PRE;
+}
+
+static int demo_infer_arch(int total, NetworkType network, int* hidden, int* layers,
+        int* actions) {
     int best_l = 1 << 30;
     for (int H = 8; H <= 4096; H += 8) {
         long rem = (long)total - DEMO_ENC_FIXED - DEMO_DEC_FIXED
                  - (long)H * (DEMO_CONCAT + 1 + DEMO_DEC_PAD + DEMO_QDIM);
-        long per_layer = 2L * H * H + MPN_SCALARS;
+        long per_layer = rnn_weight_count(network, 0, H, 1);
         if (rem <= 0) continue;
         if (rem % per_layer) continue;
         long L = rem / per_layer;
@@ -278,7 +287,7 @@ static int demo_infer_arch(int total, int* hidden, int* layers, int* actions) {
 static Weights* demo_expand_bf16(Weights* w) {
     int n = (w->size - 7) * 2;
     int h, l, a;
-    if (demo_infer_arch(n, &h, &l, &a) != 0) return w;
+    if (demo_infer_arch(n, demo_network(), &h, &l, &a) != 0) return w;
     Weights* x = (Weights*)calloc(1, sizeof(Weights) + ((size_t)n + 7) * sizeof(float));
     x->data = (float*)(x + 1);
     const uint16_t* src = (const uint16_t*)w->data;
@@ -294,8 +303,9 @@ static Weights* demo_expand_bf16(Weights* w) {
 static NethackNet* make_nethack_net(Weights* w) {
     NethackNet* net = (NethackNet*)calloc(1, sizeof(NethackNet));
     int h, l, a;
-    if (demo_infer_arch(w->size - 7, &h, &l, &a) != 0) w = demo_expand_bf16(w);
-    if (demo_infer_arch(w->size - 7, &net->hidden_size, &net->num_layers,
+    net->network = demo_network();
+    if (demo_infer_arch(w->size - 7, net->network, &h, &l, &a) != 0) w = demo_expand_bf16(w);
+    if (demo_infer_arch(w->size - 7, net->network, &net->hidden_size, &net->num_layers,
                         &net->num_actions) != 0) {
         fprintf(stderr, "nethack demo: cannot infer arch from %d floats — "
                 "checkpoint is not a nethack policy with %d actions?\n",
@@ -355,7 +365,7 @@ static NethackNet* make_nethack_net(Weights* w) {
     net->dec_q = get_weights_aligned(w, DEMO_QDIM * net->hidden_size);
     net->dec_k = get_weights_aligned(w, DEMO_INV_HID * DEMO_INV_HID);
     net->dec_tau = get_weights_aligned(w, DEMO_PTR_HEADS);
-    net->mpn = make_mpn(w, 1, net->hidden_size, net->num_layers);
+    net->rnn = make_rnn(w, net->network, 1, net->hidden_size, net->num_layers);
     static int logit_sizes[DEMO_NUM_HEADS] = {
         NETHACK_NUM_ACTIONS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS,
         NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS,
@@ -830,12 +840,12 @@ static int nethack_net_forward(NethackNet* net, const unsigned char* obs) { // f
     _linear(net->concat, net->proj_w, net->proj_b, net->hidden, 1, DEMO_CONCAT, net->hidden_size);
     _relu(net->hidden, net->hidden, net->hidden_size);
 
-    mpn(net->mpn, net->hidden);
+    rnn_forward(net->rnn, net->hidden);
 
     // pointer decoder: [22 verb | 12x55 slots | 8 dir | value]. verb/dir/value
     // from one bias-free linear; slot logit i = tau_h * cos(q_h, k_i) with
     // keys k_i projected from the per-slot features above.
-    float* hs = net->mpn->output;
+    float* hs = net->rnn->output;
     int H = net->hidden_size;
     float tmp[DEMO_DEC_LIN];
     for (int r = 0; r < DEMO_DEC_LIN; r++) {
@@ -1045,8 +1055,7 @@ static void demo_step_once(NethackNet* net, Nethack* env, float* acts_f,
         *ep_depth = env->log.max_depth;
         *ep_xp = env->log.max_xp_level;
         *ep_gt = env->log.game_time;
-        memset(net->mpn->state, 0,
-               (size_t)net->num_layers * net->hidden_size * sizeof(float));
+        rnn_reset(net->rnn);
     }
 }
 
@@ -1440,7 +1449,7 @@ static void run_demo_interactive(long max_steps) {
     else
         printf("steps=%ld\n", steps);
     env_close(&env);
-    free_mpn(net->mpn);
+    free_rnn(net->rnn);
     free(net->md);
     free(net->hidden);
     free(net->e_eff);
@@ -1519,7 +1528,7 @@ static void run_demo_auto(long max_steps, int frame_ms) {
                env.log.n, env.log.score / env.log.n,
                env.log.max_depth / env.log.n, env.log.max_xp_level / env.log.n);
     env_close(&env);
-    free_mpn(net->mpn);
+    free_rnn(net->rnn);
     free(net->md);
     free(net->hidden);
     free(net->e_eff);

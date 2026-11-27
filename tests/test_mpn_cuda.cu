@@ -1,4 +1,4 @@
-// Test harness for the MPN network (src/algo.cu mpn_*). Thin ctypes wrapper
+// Test harness for the MPN-pre network (src/networks/mpn_pre.cu mpnpre_*). Thin ctypes wrapper
 // around the real implementation; driven by tests/test_mpn.py, which builds
 // this as a shared lib and checks it against a float64 PyTorch reference.
 //
@@ -9,9 +9,9 @@
 extern "C" {
 
 static Network g_net;
-static MPNWeights* g_w = nullptr;
-static MPNActivations* g_ta = nullptr;  // train activations
-static MPNActivations* g_ra = nullptr;  // rollout activations
+static MPNPreWeights* g_w = nullptr;
+static MPNPreActivations* g_ta = nullptr;  // train activations
+static MPNPreActivations* g_ra = nullptr;  // rollout activations
 static Allocator g_pa = {}, g_aa = {}, g_ga = {}, g_ra_alloc = {};
 static int g_B = 0, g_T = 0, g_H = 0, g_L = 0;
 
@@ -22,26 +22,16 @@ float mpn_lambda_max() { return MPN_LAMBDA_MAX; }
 void mpn_init(int B, int T, int H, int L, unsigned long seed) {
     cublas_init_handle();
     g_B = B; g_T = T; g_H = H; g_L = L;
-    g_net = Network{
-        .forward = mpn_forward,
-        .forward_train = mpn_forward_train,
-        .backward = mpn_backward,
-        .init_weights = mpn_init_weights,
-        .reg_params = mpn_reg_params,
-        .reg_train = mpn_reg_train,
-        .reg_rollout = mpn_reg_rollout,
-        .create_weights = mpn_create_weights,
-        .hidden = H, .num_layers = L, .horizon = T,
-    };
-    g_w = (MPNWeights*)g_net.create_weights(&g_net);
+    g_net = make_network(NETWORK_MPN_PRE, H, L, T);
+    g_w = (MPNPreWeights*)g_net.create_weights(&g_net);
     g_pa = {}; g_aa = {}; g_ga = {}; g_ra_alloc = {};
     g_net.reg_params(g_w, &g_pa);
     alloc_create(&g_pa);
-    g_ta = (MPNActivations*)calloc(1, sizeof(MPNActivations));
+    g_ta = (MPNPreActivations*)calloc(1, sizeof(MPNPreActivations));
     g_net.reg_train(g_w, g_ta, &g_aa, &g_ga, B * T);
     alloc_create(&g_aa);
     alloc_create(&g_ga);
-    g_ra = (MPNActivations*)calloc(1, sizeof(MPNActivations));
+    g_ra = (MPNPreActivations*)calloc(1, sizeof(MPNPreActivations));
     g_net.reg_rollout(g_w, g_ra, &g_ra_alloc, B);
     alloc_create(&g_ra_alloc);
     ulong s = seed;

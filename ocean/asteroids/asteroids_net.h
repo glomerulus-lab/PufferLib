@@ -1,11 +1,11 @@
-// CPU asteroids policy: entity encoder + MPN + decoder.
+// CPU asteroids policy: entity encoder + RNN + decoder.
 // Weight order matches CUDA weights_create / reg_params:
 //   encoder input_w (16 x 9), encoder output_w (hidden x 16),
-//   decoder ((4+1) x hidden), mpn layers (W 2*hidden x hidden, then MPN_SCALARS each).
+//   decoder ((4+1) x hidden), recurrent layers (per [policy] network; see RNN in puffercpu.c).
 // Forward matches ocean/asteroids/asteroids.cu:
 //   materialize 26 entities [self(4) | point_i(5)], Linear 9->16, ReLU,
-//   Linear 16->hidden, max-pool over the 26 points, then MPN + decoder.
-// Include puffercpu.c first (Linear / ReLU / MPN).
+//   Linear 16->hidden, max-pool over the 26 points, then RNN + decoder.
+// Include puffercpu.c first (Linear / ReLU / RNN).
 
 #define AE_SELF_DIM 4
 #define AE_POINT_DIM 5
@@ -29,7 +29,7 @@ struct AsteroidsNet {
     ReLU* entity_relu;
     Linear* out_fc;
     Linear* decoder;
-    MPN* mpn;
+    RNN* rnn;
     Multidiscrete* multidiscrete;
 };
 
@@ -37,15 +37,15 @@ static inline int puf_ae_align8(int n) {
     return (n + 7) & ~7;
 }
 
-static inline int asteroids_weight_count(int hidden, int layers) {
+static inline int asteroids_weight_count(NetworkType network, int hidden, int layers) {
     int n = 0;
     n = puf_ae_align8(n + AE_ENTITY_HIDDEN * AE_ENTITY_IN);
     n = puf_ae_align8(n + hidden * AE_ENTITY_HIDDEN);
     n = puf_ae_align8(n + (AE_ATN + 1) * hidden);
-    return mpn_weight_count(n, hidden, layers);
+    return rnn_weight_count(network, n, hidden, layers);
 }
 
-static inline AsteroidsNet* init_asteroids_net(Weights* weights, int num_agents,
+static inline AsteroidsNet* init_asteroids_net(Weights* weights, NetworkType network, int num_agents,
         int hidden, int layers) {
     AsteroidsNet* net = (AsteroidsNet*)calloc(1, sizeof(AsteroidsNet));
     net->num_agents = num_agents;
@@ -59,7 +59,7 @@ static inline AsteroidsNet* init_asteroids_net(Weights* weights, int num_agents,
     net->out_fc = make_linear(weights, num_agents * AE_NUM_POINTS,
         AE_ENTITY_HIDDEN, hidden);
     net->decoder = make_linear(weights, num_agents, hidden, AE_ATN + 1);
-    net->mpn = make_mpn(weights, num_agents, hidden, layers);
+    net->rnn = make_rnn(weights, network, num_agents, hidden, layers);
     int logit_sizes[1] = {AE_ATN};
     net->multidiscrete = make_multidiscrete(num_agents, logit_sizes, 1);
     return net;
@@ -72,7 +72,7 @@ static inline void free_asteroids_net(AsteroidsNet* net) {
     free(net->entity_relu);
     free(net->out_fc);
     free(net->decoder);
-    free_mpn(net->mpn);
+    free_rnn(net->rnn);
     free(net->multidiscrete);
     free(net);
 }
@@ -103,9 +103,9 @@ static inline void asteroids_encode(AsteroidsNet* net, const float* observations
 
 static inline void forward_asteroids(AsteroidsNet* net, const float* observations,
         float* terminals, float* actions) {
-    mpn_zero_term(net->mpn, terminals);
+    rnn_zero_term(net->rnn, terminals);
     asteroids_encode(net, observations, NULL);
-    mpn(net->mpn, net->encoded);
-    linear(net->decoder, net->mpn->output);
+    rnn_forward(net->rnn, net->encoded);
+    linear(net->decoder, net->rnn->output);
     multidiscrete(net->multidiscrete, net->decoder->output, actions, 0, NULL);
 }
