@@ -13,7 +13,7 @@ from `[policy] network` (default `mpn_pre`, set in `config/default.ini`):
 |---|---|---|
 | `mingru` | `src/networks/mingru.cu` (the 5.0 MinGRU) | $H$ |
 | `mpn_pre` | `src/networks/mpn_pre.cu` (this document) | $H$ |
-| `mpn` | full MPN (not implemented yet) | $H^2$ |
+| `mpn` | `src/networks/mpn.cu` (see [Full MPN](#full-mpn)) | $H^2$ |
 
 `build_arch` in `src/algo.cu` fills the `Network` vtable via `make_network`,
 which also sets `state_size`; the trainer allocates recurrent state as
@@ -195,6 +195,65 @@ can reuse it without recomputing the recurrence.
   `[policy] network` it was trained with. MinGRU and MPNpre have different
   parameter counts ($3H^2$ vs. $2H^2 + 8$ per layer), so a mismatch fails the
   weight-count check.
+
+## Full MPN
+
+`[policy] network = mpn` (`src/networks/mpn.cu`, CPU mirror `mpn_layer` in
+`src/puffercpu.c`) keeps the full plastic matrix of Aitken & Mihalas (Eq. 1):
+one $M \in \mathbb{R}^{H \times H}$ per layer per agent. It has the same
+parameters as MPNpre ($W = [W_a; W_g]$ and $[\rho, \eta]$, same init and the
+same $\lambda$, $c$ mapping), but only $W_a$ is plastic and the Hebbian update
+uses the postsynaptic activity $h_t$:
+
+$$
+\begin{aligned}
+\tilde M_{t-1} &= (1 - d_t) M_{t-1} \\
+a_t &= (W_a \odot (1 + \tilde M_{t-1})) x_t, \quad g_t = W_g x_t \\
+h_t &= \tanh(a_t), \quad s_t = \sigma(g_t) \\
+y_t &= s_t \odot h_t + (1 - s_t) \odot x_t \\
+M_t &= \lambda \tilde M_{t-1} + c\, h_t x_t^{\top}
+\end{aligned}
+$$
+
+Unlike MPNpre, $M$ depends on $h$, so the recurrence is nonlinear and has to
+run step by step. $W x_t$ is still one time-parallel GEMM; the scan adds
+$(W_a \odot \tilde M_{t-1}) x_t$ and updates $M$.
+
+**Backward.** With $G_t = \partial \mathcal L / \partial M_t$ ($G_T = 0$) and
+$\delta_t = \partial \mathcal L / \partial y_t$, for $t = T, \dots, 1$:
+
+$$
+\begin{aligned}
+\tfrac{\partial \mathcal L}{\partial h_t} &= \delta_t \odot s_t + c\, G_t x_t, \qquad
+\tfrac{\partial \mathcal L}{\partial a_t} = \tfrac{\partial \mathcal L}{\partial h_t} \odot (1 - h_t^2) \\
+\tfrac{\partial \mathcal L}{\partial x_t} &= \delta_t \odot (1 - s_t)
+  + (W_a \odot (1 + \tilde M_{t-1}))^{\top} \tfrac{\partial \mathcal L}{\partial a_t}
+  + W_g^{\top} \tfrac{\partial \mathcal L}{\partial g_t} + c\, G_t^{\top} h_t \\
+\tfrac{\partial \mathcal L}{\partial W_a} &\mathrel{+}= \big(\tfrac{\partial \mathcal L}{\partial a_t} x_t^{\top}\big) \odot (1 + \tilde M_{t-1}) \\
+G_{t-1} &= (1 - d_t) \big(\lambda G_t + W_a \odot (\tfrac{\partial \mathcal L}{\partial a_t} x_t^{\top})\big) \\
+\tfrac{\partial \mathcal L}{\partial \lambda} &\mathrel{+}= \textstyle\sum G_t \odot \tilde M_{t-1}, \qquad
+\tfrac{\partial \mathcal L}{\partial c} \mathrel{+}= h_t^{\top} G_t x_t
+\end{aligned}
+$$
+
+**Kernels.** Row $i$ of $M$ only needs $x_t$ and $h_{t,i}$, so one warp owns one
+(agent, row), keeps that row of $M$ (forward) or $G$ (backward) in registers
+for the whole horizon, and needs no cross-warp sync. The scans are templated on
+$K = H/32$, so `hidden_size` must be one of 32, 64, 128, 256, 512 or 1024. The
+unmodulated terms ($\partial a\, x^\top$ for $\partial W$, $W^\top \partial a$
+for $\partial x$) go through the usual GEMMs; the plastic terms that sum across
+rows ($\partial x$) or agents ($\partial W_a$) use f32 atomics.
+
+**Memory.** Training caches every $\tilde M_{t-1}$:
+`num_layers x minibatch_size x H^2` elements (printed at startup; e.g. 1 GB in
+bf16 for 4 layers, minibatch 8192, $H = 128$). Recurrent state is
+`num_layers x total_agents x H^2` per copy, and the trainer keeps several
+copies (also printed). The trainer refuses state tensors over $2^{31}$
+elements.
+
+**Not yet optimized.** The cache could be replaced by checkpointing every
+$K$ steps and recomputing, and the $\partial x$ atomics by a per-agent block
+reduction.
 
 ## Reference
 

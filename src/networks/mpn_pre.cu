@@ -10,15 +10,6 @@
 // Included from algo.cu; selected with [policy] network = mpn_pre.
 #include "mpn_common.cu"
 
-#define MPNPRE_INIT_RHO 3.0f  // lambda ~= 0.905
-#define MPNPRE_INIT_ETA 1.0f
-
-__device__ __forceinline__ void mpnpre_coeffs(const precision_t* __restrict__ scal,
-        int H, float* lam, float* c) {
-    *lam = MPN_LAMBDA_MAX * sigmoid(to_float(scal[0]));
-    *c = to_float(scal[1]) * rsqrtf((float)H);
-}
-
 // Rollout pre-step: u = x*(1+m), then m <- lambda*m + c*x in place.
 __global__ void mpnpre_step_pre(precision_t* __restrict__ u,
         precision_t* __restrict__ state, const precision_t* __restrict__ x,
@@ -28,26 +19,11 @@ __global__ void mpnpre_step_pre(precision_t* __restrict__ u,
         return;
     }
     float lam, c;
-    mpnpre_coeffs(scal, H, &lam, &c);
+    mpn_coeffs(scal, H, &lam, &c);
     float m = to_float(state[idx]);
     float xv = to_float(x[idx]);
     u[idx] = from_float(xv * (1.0f + m));
     state[idx] = from_float(lam * m + c * xv);
-}
-
-// out = s*tanh(a) + (1-s)*x over rows of combined = [a(H) | g(H)].
-// out may alias x (rollout reuses one buffer across layers).
-__global__ void mpnpre_post(precision_t* out, const precision_t* __restrict__ combined,
-        const precision_t* x, int N, int H) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N * H) {
-        return;
-    }
-    int r = idx / H, j = idx % H;
-    float a = to_float(combined[r * 2 * H + j]);
-    float s = sigmoid(to_float(combined[r * 2 * H + H + j]));
-    float xv = to_float(x[idx]);
-    out[idx] = from_float(s * tanhf(a) + (1.0f - s) * xv);
 }
 
 // Train scan over T, one thread per (b, j). Caches post-reset m_{t-1} for bwd
@@ -62,7 +38,7 @@ __global__ void mpnpre_scan_forward(precision_t* __restrict__ u,
     }
     int b = idx / H, j = idx % H;
     float lam, c;
-    mpnpre_coeffs(scal, H, &lam, &c);
+    mpn_coeffs(scal, H, &lam, &c);
     float m = to_float(state[idx]);
     long base = (long)b * T * H + j;
     for (int t = 0; t < T; t++) {
@@ -111,7 +87,7 @@ __global__ void mpnpre_scan_backward(precision_t* __restrict__ grad_u,
     if (idx < B * H) {
         int b = idx / H, j = idx % H;
         float lam, c;
-        mpnpre_coeffs(scal, H, &lam, &c);
+        mpn_coeffs(scal, H, &lam, &c);
         long base = (long)b * T * H + j;
         float g = 0.0f;
         for (int t = T - 1; t >= 0; t--) {
@@ -140,23 +116,6 @@ __global__ void mpnpre_scan_backward(precision_t* __restrict__ grad_u,
     }
 }
 
-// Chain (dlambda, dc) to the stored params (rho, eta); zero the pad slots.
-__global__ void mpnpre_scalar_grad(precision_t* __restrict__ sgrad,
-        const float* __restrict__ scal_acc, const precision_t* __restrict__ scal, int H) {
-    int i = threadIdx.x;
-    if (i >= MPN_SCALARS) {
-        return;
-    }
-    float v = 0.0f;
-    if (i == 0) {
-        float sg = sigmoid(to_float(scal[0]));
-        v = scal_acc[0] * MPN_LAMBDA_MAX * sg * (1.0f - sg);
-    } else if (i == 1) {
-        v = scal_acc[1] * rsqrtf((float)H);
-    }
-    sgrad[i] = from_float(v);
-}
-
 struct MPNPreActivations {
     // Rollout
     Prec* combined;       // (B rollout, 2H)[num_layers]
@@ -177,39 +136,9 @@ struct MPNPreActivations {
     precision_t* terminals;  // (B, TT) from forward_train, read in backward
 };
 
-struct MPNPreWeights {
-    int hidden, num_layers, horizon;
-    Prec* weights;  // (2H, H)[num_layers]
-    Prec* scalars;  // (MPN_SCALARS)[num_layers]: [rho, eta, 0...]
-};
-
-void mpnpre_init_weights(void* w, ulong* seed, cudaStream_t stream) {
-    MPNPreWeights* m = (MPNPreWeights*)w;
-    for (int i = 0; i < m->num_layers; i++) {
-        Prec w2d = {
-            .data = m->weights[i].data,
-            .shape = {2 * m->hidden, m->hidden},
-        };
-        puf_kaiming_init(&w2d, 1.0f, (*seed)++, stream);
-        mpn_scalar_init<<<1, MPN_SCALARS, 0, stream>>>(
-            m->scalars[i].data, MPNPRE_INIT_RHO, MPNPRE_INIT_ETA);
-    }
-}
-
-// Order (W, scalars) per layer must match mpnpre_reg_train's grads and the CPU loader.
-void mpnpre_reg_params(void* w, Allocator* alloc) {
-    MPNPreWeights* m = (MPNPreWeights*)w;
-    for (int i = 0; i < m->num_layers; i++) {
-        m->weights[i] = {.shape = {2 * m->hidden, m->hidden}};
-        m->scalars[i] = {.shape = {MPN_SCALARS}};
-        alloc_register(alloc, &m->weights[i]);
-        alloc_register(alloc, &m->scalars[i]);
-    }
-}
-
 void mpnpre_reg_train(void* w, void* activations,
         Allocator* acts, Allocator* grads, int B_TT) {
-    MPNPreWeights* m = (MPNPreWeights*)w;
+    MPNWeights* m = (MPNWeights*)w;
     MPNPreActivations* a = (MPNPreActivations*)activations;
     int H = m->hidden, TT = m->horizon, B = B_TT / TT, L = m->num_layers;
     a->saved_inputs = (Prec*)calloc(L, sizeof(Prec));
@@ -248,7 +177,7 @@ void mpnpre_reg_train(void* w, void* activations,
 
 void mpnpre_reg_rollout(void* weights, void* activations,
         Allocator* alloc, int B_inf) {
-    MPNPreWeights* w = (MPNPreWeights*)weights;
+    MPNWeights* w = (MPNWeights*)weights;
     MPNPreActivations* a = (MPNPreActivations*)activations;
     int H = w->hidden;
     a->combined = (Prec*)calloc(w->num_layers, sizeof(Prec));
@@ -262,20 +191,9 @@ void mpnpre_reg_rollout(void* weights, void* activations,
     alloc_register(alloc, &a->out);
 }
 
-void* mpnpre_create_weights(void* self) {
-    Network* n = (Network*)self;
-    MPNPreWeights* mw = (MPNPreWeights*)calloc(1, sizeof(MPNPreWeights));
-    mw->hidden = n->hidden;
-    mw->num_layers = n->num_layers;
-    mw->horizon = n->horizon;
-    mw->weights = (Prec*)calloc(n->num_layers, sizeof(Prec));
-    mw->scalars = (Prec*)calloc(n->num_layers, sizeof(Prec));
-    return mw;
-}
-
 Prec mpnpre_forward(void* w, Prec x, Prec state,
         void* activations, cudaStream_t stream) {
-    MPNPreWeights* m = (MPNPreWeights*)w;
+    MPNWeights* m = (MPNWeights*)w;
     MPNPreActivations* a = (MPNPreActivations*)activations;
     int B = state.shape[1];
     int H = state.shape[2];
@@ -285,7 +203,7 @@ Prec mpnpre_forward(void* w, Prec x, Prec state,
         mpnpre_step_pre<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
             u.data, state_i.data, x.data, m->scalars[i].data, B * H, H);
         puf_mm(&u, &m->weights[i], &a->combined[i], stream);
-        mpnpre_post<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
+        mpn_post<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
             a->out.data, a->combined[i].data, x.data, B, H);
         x = a->out;
     }
@@ -294,7 +212,7 @@ Prec mpnpre_forward(void* w, Prec x, Prec state,
 
 Prec mpnpre_forward_train(void* w, Prec x, Prec state, Prec terminals,
         void* activations, int agent_off, cudaStream_t stream) {
-    MPNPreWeights* m = (MPNPreWeights*)w;
+    MPNWeights* m = (MPNWeights*)w;
     MPNPreActivations* a = (MPNPreActivations*)activations;
     int B = (int)x.shape[0], TT = (int)x.shape[1], H = m->hidden;
     a->terminals = terminals.data;
@@ -305,7 +223,7 @@ Prec mpnpre_forward_train(void* w, Prec x, Prec state, Prec terminals,
             a->u_bufs[i].data, a->m_prev[i].data, a->saved_inputs[i].data,
             state_i.data, a->terminals, m->scalars[i].data, B, TT, H);
         puf_mm(&a->u_bufs[i], &m->weights[i], &a->combined_bufs[i], stream);
-        mpnpre_post<<<grid_size(B * TT * H), BLOCK_SIZE, 0, stream>>>(
+        mpn_post<<<grid_size(B * TT * H), BLOCK_SIZE, 0, stream>>>(
             a->outs[i].data, a->combined_bufs[i].data, a->saved_inputs[i].data,
             B * TT, H);
         x = a->outs[i];
@@ -314,7 +232,7 @@ Prec mpnpre_forward_train(void* w, Prec x, Prec state, Prec terminals,
 }
 
 Prec mpnpre_backward(void* w, Prec grad, void* activations, cudaStream_t stream) {
-    MPNPreWeights* m = (MPNPreWeights*)w;
+    MPNWeights* m = (MPNWeights*)w;
     MPNPreActivations* a = (MPNPreActivations*)activations;
     int B = (int)a->grad_hw.shape[0], TT = (int)a->grad_hw.shape[1], H = m->hidden;
     int N = B * TT;
@@ -331,7 +249,7 @@ Prec mpnpre_backward(void* w, Prec grad, void* activations, cudaStream_t stream)
         mpnpre_scan_backward<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
             a->grad_input_buf.data, a->grad_hw.data, a->saved_inputs[i].data,
             a->m_prev[i].data, a->terminals, m->scalars[i].data, acc, B, TT, H);
-        mpnpre_scalar_grad<<<1, MPN_SCALARS, 0, stream>>>(
+        mpn_scalar_grad<<<1, MPN_SCALARS, 0, stream>>>(
             a->sgrad_scratch[i].data, acc, m->scalars[i].data, H);
         grad = a->grad_input_buf;
     }

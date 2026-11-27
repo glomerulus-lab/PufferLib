@@ -11,6 +11,7 @@
 
 // C standard
 #include <cassert>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <errno.h>
@@ -1967,6 +1968,22 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     // Train-only extras on policies[0] (trainable).
     Policy* primary = &pufferl->policies[0];
     int state_size = primary->arch.network.state_size;
+    {
+        // zero_term_state / snapshot_state index (L, A, state_size) with int.
+        long state_elems = (long)num_layers * total_agents * state_size;
+        if (state_elems > INT_MAX) {
+            fprintf(stderr, "Recurrent state too large: %d layers x %d agents x %d "
+                "per agent = %ld elements (max %d). Reduce hidden_size, num_layers "
+                "or total_agents.\n", num_layers, total_agents, state_size,
+                state_elems, INT_MAX);
+            exit(1);
+        }
+        if (state_size != hidden_size) {
+            fprintf(stderr, "Recurrent state: %.2f GB per (layers x agents) copy; the "
+                "trainer keeps several (rollout buffers, train state, carry snapshots)\n",
+                (double)state_elems * sizeof(precision_t) / 1e9);
+        }
+    }
     if (hypers.async) {
         pufferl->actor_weights = weights_create(
             &primary->arch, &pufferl->weight_alloc);

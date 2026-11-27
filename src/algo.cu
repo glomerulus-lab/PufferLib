@@ -405,6 +405,7 @@ Prec decoder_backward(void* w, void* activations, Float grad_logits,
 // Recurrent networks, selected at runtime by build_arch.
 #include "networks/mingru.cu"
 #include "networks/mpn_pre.cu"
+#include "networks/mpn.cu"
 
 struct Arch {
     Encoder encoder;
@@ -517,17 +518,31 @@ Network make_network(NetworkType type, int hidden_size, int num_layers, int hori
         n.forward = mpnpre_forward;
         n.forward_train = mpnpre_forward_train;
         n.backward = mpnpre_backward;
-        n.init_weights = mpnpre_init_weights;
-        n.reg_params = mpnpre_reg_params;
+        n.init_weights = mpn_init_weights;
+        n.reg_params = mpn_reg_params;
         n.reg_train = mpnpre_reg_train;
         n.reg_rollout = mpnpre_reg_rollout;
-        n.create_weights = mpnpre_create_weights;
+        n.create_weights = mpn_create_weights;
         n.state_size = hidden_size;
         n.activation_size = sizeof(MPNPreActivations);
         break;
     case NETWORK_MPN:
-        fprintf(stderr, "[policy] network = mpn is not implemented yet\n");
-        exit(1);
+        if (!mpn_hidden_supported(hidden_size)) {
+            fprintf(stderr, "[policy] network = mpn needs hidden_size in "
+                "{32, 64, 128, 256, 512, 1024}, got %d\n", hidden_size);
+            exit(1);
+        }
+        n.forward = mpn_forward;
+        n.forward_train = mpn_forward_train;
+        n.backward = mpn_backward;
+        n.init_weights = mpn_init_weights;
+        n.reg_params = mpn_reg_params;
+        n.reg_train = mpn_reg_train;
+        n.reg_rollout = mpn_reg_rollout;
+        n.create_weights = mpn_create_weights;
+        n.state_size = hidden_size * hidden_size;
+        n.activation_size = sizeof(MPNActivations);
+        break;
     }
     return n;
 }

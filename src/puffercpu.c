@@ -459,6 +459,9 @@ void multidiscrete(Multidiscrete* layer, float* input, float* output, int hard,
 // mpn_pre: u = x*(1+m); [a|g] = u @ W^T (W: 2H x H); out = s*tanh(a) + (1-s)*x, s = sigmoid(g)
 //          m <- lambda*m + c*x,  lambda = MPN_LAMBDA_MAX*sigmoid(rho), c = eta/sqrt(H)
 //          weights per layer: W (2H x H), then [rho, eta, pad] (MPN_SCALARS)
+// mpn:     [b|g] = x @ W^T; a = b + ((W_a * M) x) (W_a = first H rows of W, * elementwise)
+//          out = s*tanh(a) + (1-s)*x, s = sigmoid(g); M <- lambda*M + c*tanh(a) x^T
+//          state per layer per agent is M (H x H, row-major); same weight layout as mpn_pre
 #define MPN_LAMBDA_MAX 0.95f
 #define MPN_SCALARS 8
 
@@ -486,7 +489,7 @@ typedef struct RNN {
     float* state;    // (num_layers, batch_size, state_size) - persists across steps
     float* output;   // (batch_size, hidden_size)
     float* u;        // (batch_size, hidden_size) mpn_pre modulated input
-    Linear** proj;   // [num_layers]: hidden -> 3H (mingru) or 2H (mpn_pre)
+    Linear** proj;   // [num_layers]: hidden -> 3H (mingru) or 2H (mpn_pre, mpn)
     float** scalars; // [num_layers] [rho, eta, pad...] (MPN variants), else NULL
     int batch_size;
     int hidden_size;
@@ -516,10 +519,6 @@ static inline int rnn_weight_count(NetworkType type, int n, int hidden, int num_
 
 RNN* make_rnn(Weights* weights, NetworkType type, int batch_size,
         int hidden_size, int num_layers) {
-    if (type == NETWORK_MPN) {
-        fprintf(stderr, "network = mpn is not implemented on CPU yet\n");
-        exit(1);
-    }
     RNN* layer = calloc(1, sizeof(RNN));
     layer->type = type;
     layer->batch_size = batch_size;
@@ -591,6 +590,43 @@ static void mpnpre_layer(RNN* layer, int l, float* x) {
     }
 }
 
+static void mpn_layer(RNN* layer, int l, float* x) {
+    int B = layer->batch_size;
+    int H = layer->hidden_size;
+    float* state_l = layer->state + (size_t)l * B * H * H;
+    float lam = MPN_LAMBDA_MAX * _sigmoid(layer->scalars[l][0]);
+    float c = layer->scalars[l][1] / sqrtf((float)H);
+    const float* Wa = layer->proj[l]->weights;  // first H rows of W (2H x H)
+    linear(layer->proj[l], x);
+    float* combined = layer->proj[l]->output;
+    for (int b = 0; b < B; b++) {
+        float* cb = combined + b * 2 * H;
+        float* xb = x + b * H;
+        for (int i = 0; i < H; i++) {
+            float* Mi = state_l + ((size_t)b * H + i) * H;
+            const float* Wi = Wa + (size_t)i * H;
+            float mod = 0.0f;
+            for (int j = 0; j < H; j++) {
+                mod += Wi[j] * Mi[j] * xb[j];
+            }
+            cb[i] += mod;
+            float h = tanhf(cb[i]);
+            for (int j = 0; j < H; j++) {
+                Mi[j] = lam * Mi[j] + c * h * xb[j];
+            }
+        }
+    }
+    for (int b = 0; b < B; b++) {
+        float* cb = combined + b * 2 * H;
+        float* xb = x + b * H;
+        float* ob = layer->output + b * H;
+        for (int h = 0; h < H; h++) {
+            float s = _sigmoid(cb[H + h]);
+            ob[h] = s * tanhf(cb[h]) + (1.0f - s) * xb[h];
+        }
+    }
+}
+
 // x may alias layer->output (layers after the first read the previous output);
 // each layer only writes output[b*H + h] after reading x[b*H + h].
 void rnn_forward(RNN* layer, float* input) {
@@ -604,7 +640,7 @@ void rnn_forward(RNN* layer, float* input) {
             mpnpre_layer(layer, l, x);
             break;
         case NETWORK_MPN:
-            assert(0 && "network = mpn not implemented on CPU");
+            mpn_layer(layer, l, x);
             break;
         }
         x = layer->output;
