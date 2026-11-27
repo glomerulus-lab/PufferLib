@@ -10,7 +10,14 @@ set -euo pipefail
 
 ENV_NAME="${1:-breakout}"
 shift || true
-EXTRA=("$@")
+# ./puffer takes overrides as --section.key=value; accept them with or without --.
+EXTRA=()
+for arg in "$@"; do
+    case "$arg" in
+        --*) EXTRA+=("$arg") ;;
+        *)   EXTRA+=("--$arg") ;;
+    esac
+done
 
 STEPS="${PROFILE_STEPS:-4000000}"
 OUT="${PROFILE_OUT:-profile}"
@@ -33,8 +40,8 @@ nsys profile \
     --trace=cuda,nvtx \
     -o "$OUT" \
     ./puffer train \
-        "base.profile=1" \
-        "train.total_timesteps=$STEPS" \
+        "--base.profile=1" \
+        "--train.total_timesteps=$STEPS" \
         "${EXTRA[@]}"
 
 REP="${OUT}.nsys-rep"
