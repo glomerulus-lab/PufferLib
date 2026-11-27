@@ -191,7 +191,10 @@ elif [ "$ENV" = "nethack" ]; then
     NETHACK_LIB_DIR="$(pwd)/$NLE_DIR/build"
     if [ ! -f "$NETHACK_LIB_DIR/libnethack.so" ]; then
         echo "Building libnethack.so ..."
-        cmake -S "$NLE_DIR" -B "$NETHACK_LIB_DIR" -DCMAKE_BUILD_TYPE=Release
+        # fast-nle's nle.c calls nle_lnc_bits before declaring it; GCC 14+ makes
+        # that an error. Safe to demote: the function returns int.
+        cmake -S "$NLE_DIR" -B "$NETHACK_LIB_DIR" -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-Wno-error=implicit-function-declaration"
         cmake --build "$NETHACK_LIB_DIR" --target nethack -j$(nproc)
     fi
     INCLUDES+=(-I./$NLE_DIR/include
