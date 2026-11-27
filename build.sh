@@ -191,10 +191,14 @@ elif [ "$ENV" = "nethack" ]; then
     NETHACK_LIB_DIR="$(pwd)/$NLE_DIR/build"
     if [ ! -f "$NETHACK_LIB_DIR/libnethack.so" ]; then
         echo "Building libnethack.so ..."
-        # fast-nle's nle.c calls nle_lnc_bits before declaring it; GCC 14+ makes
-        # that an error. Safe to demote: the function returns int.
+        # Workarounds for fast-nle on newer toolchains:
+        # - nle.c calls nle_lnc_bits before declaring it; GCC 14+ makes that an
+        #   error. Safe to demote: the function returns int.
+        # - sys.c includes <pthread.h> after hack.h, whose `#define flags ...`
+        #   breaks newer glibc headers. Pre-include pthread.h everywhere, with
+        #   _GNU_SOURCE set first as config1.h would (it skips if already set).
         cmake -S "$NLE_DIR" -B "$NETHACK_LIB_DIR" -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_FLAGS="-Wno-error=implicit-function-declaration"
+            -DCMAKE_C_FLAGS="-Wno-error=implicit-function-declaration -D_GNU_SOURCE -include pthread.h"
         cmake --build "$NETHACK_LIB_DIR" --target nethack -j$(nproc)
     fi
     INCLUDES+=(-I./$NLE_DIR/include
